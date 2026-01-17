@@ -88,7 +88,7 @@ export const FULL_SOURCES: VideoSource[] = [
 /**
  * 示例 3: 多区域源配置
  */
-export const REGIONAL_SOURCES = {
+export const REGIONAL_SOURCES: Record<string, VideoSource[]> = {
   // 中国大陆
   cn: [
     {
