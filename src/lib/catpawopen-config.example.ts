@@ -159,7 +159,7 @@ export function getSourcesFromEnv(): VideoSource[] {
  * 示例 5: 根据条件选择源配置
  */
 export function getSourcesByEnvironment(): VideoSource[] {
-  const env = process.env.NODE_ENV || 'production';
+  const env = (process.env.NODE_ENV || 'production') as string;
 
   if (env === 'development') {
     // 开发环境使用所有源进行测试
