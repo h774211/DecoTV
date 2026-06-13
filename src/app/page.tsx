@@ -1,24 +1,17 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps, no-console */
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps */
 
 'use client';
 
 import { ChevronRight } from 'lucide-react';
 import Link from 'next/link';
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useMemo, useState } from 'react';
 
-import {
-  BangumiCalendarData,
-  GetBangumiCalendarData,
-} from '@/lib/bangumi.client';
-// 客户端收藏 API
 import {
   clearAllFavorites,
   getAllFavorites,
   getAllPlayRecords,
   subscribeToDataUpdates,
 } from '@/lib/db.client';
-import { getDoubanCategories } from '@/lib/douban.client';
-import { DoubanItem } from '@/lib/types';
 
 import CapsuleSwitch from '@/components/CapsuleSwitch';
 import ContinueWatching from '@/components/ContinueWatching';
@@ -28,18 +21,43 @@ import ScrollableRow from '@/components/ScrollableRow';
 import { useSite } from '@/components/SiteProvider';
 import VideoCard from '@/components/VideoCard';
 
+import { useGlobalCache } from '@/contexts/GlobalCacheContext';
+
 function HomeClient() {
   const [activeTab, setActiveTab] = useState<'home' | 'favorites'>('home');
-  const [hotMovies, setHotMovies] = useState<DoubanItem[]>([]);
-  const [hotTvShows, setHotTvShows] = useState<DoubanItem[]>([]);
-  const [hotVarietyShows, setHotVarietyShows] = useState<DoubanItem[]>([]);
-  const [bangumiCalendarData, setBangumiCalendarData] = useState<
-    BangumiCalendarData[]
-  >([]);
-  const [loading, setLoading] = useState(true);
   const { siteName, announcement } = useSite();
 
   const [showAnnouncement, setShowAnnouncement] = useState(false);
+
+  // === 接入全局缓存 ===
+  const { homeData, homeLoading, fetchHomeData } = useGlobalCache();
+
+  // 解构首页数据（带默认值防止 null）
+  const hotMovies = homeData?.hotMovies ?? [];
+  const hotTvShows = homeData?.hotTvShows ?? [];
+  const hotVarietyShows = homeData?.hotVarietyShows ?? [];
+  const bangumiCalendarData = homeData?.bangumiCalendar ?? [];
+  const HOME_SECTION_LIMIT = 24;
+  const hotMoviesPreview = useMemo(
+    () => hotMovies.slice(0, HOME_SECTION_LIMIT),
+    [hotMovies],
+  );
+  const hotTvShowsPreview = useMemo(
+    () => hotTvShows.slice(0, HOME_SECTION_LIMIT),
+    [hotTvShows],
+  );
+  const hotVarietyShowsPreview = useMemo(
+    () => hotVarietyShows.slice(0, HOME_SECTION_LIMIT),
+    [hotVarietyShows],
+  );
+
+  // 只在无缓存时显示骨架屏，有缓存时后台静默更新
+  const loading = homeLoading && !homeData;
+
+  // === 首次挂载时触发数据加载（利用 SWR 策略） ===
+  useEffect(() => {
+    fetchHomeData();
+  }, []);
 
   // 检查公告弹窗状态
   useEffect(() => {
@@ -67,47 +85,6 @@ function HomeClient() {
   };
 
   const [favoriteItems, setFavoriteItems] = useState<FavoriteItem[]>([]);
-
-  useEffect(() => {
-    const fetchRecommendData = async () => {
-      try {
-        setLoading(true);
-
-        // 并行获取热门电影、热门剧集和热门综艺
-        const [moviesData, tvShowsData, varietyShowsData, bangumiCalendarData] =
-          await Promise.all([
-            getDoubanCategories({
-              kind: 'movie',
-              category: '热门',
-              type: '全部',
-            }),
-            getDoubanCategories({ kind: 'tv', category: 'tv', type: 'tv' }),
-            getDoubanCategories({ kind: 'tv', category: 'show', type: 'show' }),
-            GetBangumiCalendarData(),
-          ]);
-
-        if (moviesData.code === 200) {
-          setHotMovies(moviesData.list);
-        }
-
-        if (tvShowsData.code === 200) {
-          setHotTvShows(tvShowsData.list);
-        }
-
-        if (varietyShowsData.code === 200) {
-          setHotVarietyShows(varietyShowsData.list);
-        }
-
-        setBangumiCalendarData(bangumiCalendarData);
-      } catch (error) {
-        console.error('获取推荐数据失败:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchRecommendData();
-  }, []);
 
   // 处理收藏数据更新的函数
   const updateFavoriteItems = async (allFavorites: Record<string, any>) => {
@@ -157,7 +134,7 @@ function HomeClient() {
       'favoritesUpdated',
       (newFavorites: Record<string, any>) => {
         updateFavoriteItems(newFavorites);
-      }
+      },
     );
 
     return unsubscribe;
@@ -173,7 +150,7 @@ function HomeClient() {
       {/* Hero Section */}
       <div className='relative pt-20 pb-10 sm:pt-32 sm:pb-16 overflow-hidden'>
         {/* Background Ambient Light */}
-        <div className='absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-75 h-75 sm:w-150 sm:h-150 bg-purple-500/20 rounded-full blur-[80px] sm:blur-[120px] -z-10 pointer-events-none animate-pulse'></div>
+        <div className='absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-75 h-75 sm:w-150 sm:h-150 bg-purple-500/20 rounded-full blur-[48px] sm:blur-[72px] -z-10 pointer-events-none animate-pulse'></div>
 
         <div className='flex flex-col items-center justify-center text-center px-4'>
           <div className='relative group cursor-default'>
@@ -184,7 +161,7 @@ function HomeClient() {
           </div>
 
           <div className='mt-8 animate-fade-in-up'>
-            <div className='inline-flex items-center gap-3 px-6 py-2.5 rounded-full bg-white/50 dark:bg-black/30 backdrop-blur-md border border-white/20 dark:border-white/10 shadow-lg hover:shadow-xl transition-all duration-300 hover:-translate-y-0.5'>
+            <div className='inline-flex items-center gap-3 px-6 py-2.5 rounded-full bg-white/82 dark:bg-black/72 border border-white/20 dark:border-white/10 shadow-md transition-all duration-300 hover:-translate-y-0.5'>
               <span className='text-base sm:text-lg font-medium bg-linear-to-r from-gray-800 to-gray-600 dark:from-gray-100 dark:to-gray-300 bg-clip-text text-transparent'>
                 发现
               </span>
@@ -287,7 +264,7 @@ function HomeClient() {
                         </div>
                       ))
                     : // 显示真实数据
-                      hotMovies.map((movie, index) => (
+                      hotMoviesPreview.map((movie, index) => (
                         <div
                           key={index}
                           className='min-w-24 w-24 sm:min-w-45 sm:w-44'
@@ -335,7 +312,7 @@ function HomeClient() {
                         </div>
                       ))
                     : // 显示真实数据
-                      hotTvShows.map((show, index) => (
+                      hotTvShowsPreview.map((show, index) => (
                         <div
                           key={index}
                           className='min-w-24 w-24 sm:min-w-45 sm:w-44'
@@ -399,37 +376,39 @@ function HomeClient() {
                         // 找到当前星期对应的番剧数据
                         const todayAnimes =
                           bangumiCalendarData.find(
-                            (item) => item.weekday.en === currentWeekday
+                            (item) => item.weekday.en === currentWeekday,
                           )?.items || [];
 
                         // 过滤掉无效数据
                         const validAnimes = todayAnimes.filter(
-                          (anime) => anime && anime.id
+                          (anime) => anime && anime.id,
                         );
 
-                        return validAnimes.map((anime, index) => (
-                          <div
-                            key={`${anime.id}-${index}`}
-                            className='min-w-24 w-24 sm:min-w-45 sm:w-44'
-                          >
-                            <VideoCard
-                              from='douban'
-                              title={anime.name_cn || anime.name}
-                              poster={
-                                anime.images?.large ||
-                                anime.images?.common ||
-                                anime.images?.medium ||
-                                anime.images?.small ||
-                                anime.images?.grid ||
-                                '/logo.png'
-                              }
-                              douban_id={anime.id}
-                              rate={anime.rating?.score?.toFixed(1) || ''}
-                              year={anime.air_date?.split('-')?.[0] || ''}
-                              isBangumi={true}
-                            />
-                          </div>
-                        ));
+                        return validAnimes
+                          .slice(0, HOME_SECTION_LIMIT)
+                          .map((anime, index) => (
+                            <div
+                              key={`${anime.id}-${index}`}
+                              className='min-w-24 w-24 sm:min-w-45 sm:w-44'
+                            >
+                              <VideoCard
+                                from='douban'
+                                title={anime.name_cn || anime.name}
+                                poster={
+                                  anime.images?.large ||
+                                  anime.images?.common ||
+                                  anime.images?.medium ||
+                                  anime.images?.small ||
+                                  anime.images?.grid ||
+                                  '/logo.png'
+                                }
+                                douban_id={anime.id}
+                                rate={anime.rating?.score?.toFixed(1) || ''}
+                                year={anime.air_date?.split('-')?.[0] || ''}
+                                isBangumi={true}
+                              />
+                            </div>
+                          ));
                       })()}
                 </ScrollableRow>
               </section>
@@ -463,7 +442,7 @@ function HomeClient() {
                         </div>
                       ))
                     : // 显示真实数据
-                      hotVarietyShows.map((show, index) => (
+                      hotVarietyShowsPreview.map((show, index) => (
                         <div
                           key={index}
                           className='min-w-24 w-24 sm:min-w-45 sm:w-44'
@@ -489,7 +468,7 @@ function HomeClient() {
       </div>
       {announcement && showAnnouncement && (
         <div
-          className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm dark:bg-black/70 p-4 transition-opacity duration-300 ${
+          className={`fixed inset-0 z-50 flex items-center justify-center bg-black/70 dark:bg-black/80 p-4 transition-opacity duration-300 ${
             showAnnouncement ? '' : 'opacity-0 pointer-events-none'
           }`}
           onTouchStart={(e) => {

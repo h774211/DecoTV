@@ -2,23 +2,21 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
+import { verifyApiAuth } from '@/lib/auth';
 import { getConfig, getLocalModeConfig } from '@/lib/config';
-import { db } from '@/lib/db';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-  const hasRedis = !!(process.env.REDIS_URL || process.env.KV_REST_API_URL);
-  const isLocalMode = storageType === 'localstorage' && !hasRedis;
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
 
   try {
     const body = await request.json();
 
-    // 🔐 本地模式（无数据库）：跳过认证，返回成功
-    // 安全性说明：仅当没有配置任何数据库时才启用此模式
-    if (isLocalMode) {
+    // 本地模式（无数据库）：跳过认证，返回成功
+    if (authResult.isLocalMode) {
       const {
         SiteName,
         Announcement,
@@ -28,8 +26,14 @@ export async function POST(request: NextRequest) {
         DoubanProxy,
         DoubanImageProxyType,
         DoubanImageProxy,
+        TmdbApiKey,
+        TmdbProxyType,
+        TmdbProxy,
+        TmdbReverseProxy,
         DisableYellowFilter,
         FluidSearch,
+        SearchResultLoadMode,
+        LoginBackground,
       } = body as {
         SiteName: string;
         Announcement: string;
@@ -39,9 +43,18 @@ export async function POST(request: NextRequest) {
         DoubanProxy: string;
         DoubanImageProxyType: string;
         DoubanImageProxy: string;
+        TmdbApiKey?: string;
+        TmdbProxyType?: 'direct' | 'forward' | 'reverse';
+        TmdbProxy?: string;
+        TmdbReverseProxy?: string;
         DisableYellowFilter: boolean;
         FluidSearch: boolean;
+        SearchResultLoadMode?: 'infinite' | 'pagination';
+        LoginBackground?: string;
       };
+
+      const normalizedSearchResultLoadMode =
+        SearchResultLoadMode === 'pagination' ? 'pagination' : 'infinite';
 
       const localConfig = getLocalModeConfig();
       localConfig.SiteConfig = {
@@ -55,6 +68,17 @@ export async function POST(request: NextRequest) {
         DoubanImageProxy,
         DisableYellowFilter,
         FluidSearch,
+        SearchResultLoadMode: normalizedSearchResultLoadMode,
+        LoginBackground,
+      };
+      localConfig.TMDBConfig = {
+        ApiKey: TmdbApiKey || localConfig.TMDBConfig?.ApiKey || '',
+        ProxyType: (TmdbProxyType || 'direct') as
+          | 'direct'
+          | 'forward'
+          | 'reverse',
+        Proxy: TmdbProxy || '',
+        ReverseProxy: TmdbReverseProxy || '',
       };
       return NextResponse.json({
         message: '站点配置更新成功（本地模式）',
@@ -62,11 +86,16 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const authInfo = getAuthInfoFromCookie(request);
-    if (!authInfo || !authInfo.username) {
+    // 认证失败
+    if (!authResult.isValid) {
+      console.log('[admin/site] 认证失败:', {
+        hasAuth: !!request.cookies.get('auth'),
+        isLocalMode: authResult.isLocalMode,
+      });
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-    const username = authInfo.username;
+
+    const username = authResult.username;
 
     const {
       SiteName,
@@ -77,8 +106,14 @@ export async function POST(request: NextRequest) {
       DoubanProxy,
       DoubanImageProxyType,
       DoubanImageProxy,
+      TmdbApiKey,
+      TmdbProxyType,
+      TmdbProxy,
+      TmdbReverseProxy,
       DisableYellowFilter,
       FluidSearch,
+      SearchResultLoadMode,
+      LoginBackground,
     } = body as {
       SiteName: string;
       Announcement: string;
@@ -88,9 +123,18 @@ export async function POST(request: NextRequest) {
       DoubanProxy: string;
       DoubanImageProxyType: string;
       DoubanImageProxy: string;
+      TmdbApiKey?: string;
+      TmdbProxyType?: 'direct' | 'forward' | 'reverse';
+      TmdbProxy?: string;
+      TmdbReverseProxy?: string;
       DisableYellowFilter: boolean;
       FluidSearch: boolean;
+      SearchResultLoadMode?: 'infinite' | 'pagination';
+      LoginBackground?: string;
     };
+
+    const normalizedSearchResultLoadMode =
+      SearchResultLoadMode === 'pagination' ? 'pagination' : 'infinite';
 
     // 参数校验
     if (
@@ -102,8 +146,16 @@ export async function POST(request: NextRequest) {
       typeof DoubanProxy !== 'string' ||
       typeof DoubanImageProxyType !== 'string' ||
       typeof DoubanImageProxy !== 'string' ||
+      (TmdbApiKey !== undefined && typeof TmdbApiKey !== 'string') ||
+      (TmdbProxyType !== undefined && typeof TmdbProxyType !== 'string') ||
+      (TmdbProxy !== undefined && typeof TmdbProxy !== 'string') ||
+      (TmdbReverseProxy !== undefined &&
+        typeof TmdbReverseProxy !== 'string') ||
       typeof DisableYellowFilter !== 'boolean' ||
-      typeof FluidSearch !== 'boolean'
+      typeof FluidSearch !== 'boolean' ||
+      (SearchResultLoadMode !== undefined &&
+        SearchResultLoadMode !== 'infinite' &&
+        SearchResultLoadMode !== 'pagination')
     ) {
       return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
     }
@@ -131,12 +183,32 @@ export async function POST(request: NextRequest) {
       DoubanProxy,
       DoubanImageProxyType,
       DoubanImageProxy,
+      TmdbProxyType: TmdbProxyType || 'direct',
+      TmdbProxy: TmdbProxy || '',
+      TmdbReverseProxy: TmdbReverseProxy || '',
       DisableYellowFilter,
       FluidSearch,
+      SearchResultLoadMode: normalizedSearchResultLoadMode,
+      LoginBackground: LoginBackground || '',
     };
 
-    // 写入数据库
-    await db.saveAdminConfig(adminConfig);
+    adminConfig.TMDBConfig = {
+      ...(adminConfig.TMDBConfig || {
+        ApiKey: process.env.TMDB_API_KEY || '',
+      }),
+      ApiKey:
+        TmdbApiKey !== undefined
+          ? TmdbApiKey
+          : adminConfig.TMDBConfig?.ApiKey || '',
+      ProxyType: (TmdbProxyType || 'direct') as
+        | 'direct'
+        | 'forward'
+        | 'reverse',
+      Proxy: TmdbProxy || '',
+      ReverseProxy: TmdbReverseProxy || '',
+    };
+
+    await persistAdminConfigMutation(adminConfig);
 
     return NextResponse.json(
       { ok: true },

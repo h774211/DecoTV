@@ -2,7 +2,9 @@
 
 import { db } from '@/lib/db';
 
-import { AdminConfig } from './admin.types';
+import { AdminConfig, SearchResultLoadMode } from './admin.types';
+import { getDefaultPanSouConfig, normalizePanSouConfig } from './pansou';
+import { normalizePrivateLibraryConfig } from './private-library-config';
 
 export interface ApiSite {
   key: string;
@@ -10,6 +12,7 @@ export interface ApiSite {
   name: string;
   detail?: string;
   is_adult?: boolean; // 标记是否为成人资源
+  disable_ad_filter?: boolean; // 该源不走 m3u8 广告过滤代理
 }
 
 export interface LiveCfg {
@@ -56,6 +59,85 @@ export const API_CONFIG = {
 
 // 在模块加载时根据环境决定配置来源
 let cachedConfig: AdminConfig;
+
+function getDefaultSearchResultLoadMode(): SearchResultLoadMode {
+  return process.env.NEXT_PUBLIC_SEARCH_RESULT_LOAD_MODE === 'pagination'
+    ? 'pagination'
+    : 'infinite';
+}
+
+function getDefaultRegistrationEnabled(): boolean {
+  return process.env.NEXT_PUBLIC_ENABLE_REGISTRATION === 'true';
+}
+
+function getDefaultRegistrationUserGroup(): string {
+  return process.env.DEFAULT_REGISTRATION_GROUP?.trim() || '';
+}
+
+function normalizeForComparison(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeForComparison(item));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, normalizeForComparison(item)]),
+    );
+  }
+
+  return value;
+}
+
+function isConfigConsistent(
+  expected: AdminConfig,
+  actual: AdminConfig,
+): boolean {
+  return (
+    JSON.stringify(normalizeForComparison(expected)) ===
+    JSON.stringify(normalizeForComparison(actual))
+  );
+}
+
+// 清除配置缓存，强制下次 getConfig() 重新从存储读取
+export function invalidateConfigCache(): void {
+  cachedConfig = undefined as unknown as AdminConfig;
+}
+
+export async function saveAdminConfigWithVerification(
+  config: AdminConfig,
+): Promise<AdminConfig> {
+  await db.saveAdminConfig(config);
+  invalidateConfigCache();
+
+  const persistedConfig = await db.getAdminConfig();
+  if (!persistedConfig) {
+    throw new Error('配置写入失败：写入后读取为空');
+  }
+
+  if (!isConfigConsistent(config, persistedConfig)) {
+    throw new Error('配置写入校验失败：写入后与提交内容不一致');
+  }
+
+  const checkedConfig = configSelfCheck(persistedConfig);
+  if (!isConfigConsistent(checkedConfig, persistedConfig)) {
+    await db.saveAdminConfig(checkedConfig);
+    const checkedPersisted = await db.getAdminConfig();
+    if (
+      !checkedPersisted ||
+      !isConfigConsistent(checkedConfig, checkedPersisted)
+    ) {
+      throw new Error('配置自检回写失败：写入后校验不一致');
+    }
+    cachedConfig = checkedPersisted;
+    return checkedPersisted;
+  }
+
+  cachedConfig = persistedConfig;
+  return persistedConfig;
+}
 
 // 从配置文件补充管理员配置
 export function refineConfig(adminConfig: AdminConfig): AdminConfig {
@@ -213,23 +295,48 @@ async function getInitConfig(
       SearchDownstreamMaxPage:
         Number(process.env.NEXT_PUBLIC_SEARCH_MAX_PAGE) || 5,
       SiteInterfaceCacheTime: cfgFile.cache_time || 7200,
-      DoubanProxyType:
-        process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'cmliussss-cdn-tencent',
+      DoubanProxyType: process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'auto',
       DoubanProxy: process.env.NEXT_PUBLIC_DOUBAN_PROXY || '',
       DoubanImageProxyType:
-        process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE ||
-        'cmliussss-cdn-tencent',
+        process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE || 'auto',
       DoubanImageProxy: process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '',
+      TmdbProxyType: process.env.TMDB_REVERSE_PROXY
+        ? 'reverse'
+        : process.env.TMDB_PROXY
+          ? 'forward'
+          : 'direct',
+      TmdbProxy: process.env.TMDB_PROXY || '',
+      TmdbReverseProxy: process.env.TMDB_REVERSE_PROXY || '',
       DisableYellowFilter:
         process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
       FluidSearch: process.env.NEXT_PUBLIC_FLUID_SEARCH !== 'false',
+      SearchResultLoadMode: getDefaultSearchResultLoadMode(),
     },
     UserConfig: {
+      RegistrationEnabled: getDefaultRegistrationEnabled(),
+      RegistrationDefaultUserGroup: getDefaultRegistrationUserGroup(),
       Users: [],
     },
     SourceConfig: [],
     CustomCategories: [],
     LiveConfig: [],
+    PanSouConfig: getDefaultPanSouConfig(),
+    TMDBConfig: {
+      ApiKey: process.env.TMDB_API_KEY || '',
+      ProxyType: process.env.TMDB_REVERSE_PROXY
+        ? 'reverse'
+        : process.env.TMDB_PROXY
+          ? 'forward'
+          : 'direct',
+      Proxy: process.env.TMDB_PROXY || '',
+      ReverseProxy: process.env.TMDB_REVERSE_PROXY || '',
+    },
+    PrivateLibraryConfig: {
+      connectors: [],
+    },
+    AdFilterConfig: {
+      enabled: true,
+    },
   };
 
   // 补充用户信息
@@ -317,18 +424,26 @@ export function getLocalModeConfig(): AdminConfig {
       SearchDownstreamMaxPage:
         Number(process.env.NEXT_PUBLIC_SEARCH_MAX_PAGE) || 5,
       SiteInterfaceCacheTime: 7200,
-      DoubanProxyType:
-        process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'cmliussss-cdn-tencent',
+      DoubanProxyType: process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'auto',
       DoubanProxy: process.env.NEXT_PUBLIC_DOUBAN_PROXY || '',
       DoubanImageProxyType:
-        process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE ||
-        'cmliussss-cdn-tencent',
+        process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE || 'auto',
       DoubanImageProxy: process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '',
+      TmdbProxyType: process.env.TMDB_REVERSE_PROXY
+        ? 'reverse'
+        : process.env.TMDB_PROXY
+          ? 'forward'
+          : 'direct',
+      TmdbProxy: process.env.TMDB_PROXY || '',
+      TmdbReverseProxy: process.env.TMDB_REVERSE_PROXY || '',
       DisableYellowFilter:
         process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true',
       FluidSearch: process.env.NEXT_PUBLIC_FLUID_SEARCH !== 'false',
+      SearchResultLoadMode: getDefaultSearchResultLoadMode(),
     },
     UserConfig: {
+      RegistrationEnabled: getDefaultRegistrationEnabled(),
+      RegistrationDefaultUserGroup: getDefaultRegistrationUserGroup(),
       Users: [
         {
           username: process.env.USERNAME || 'admin',
@@ -340,39 +455,124 @@ export function getLocalModeConfig(): AdminConfig {
     SourceConfig: [],
     CustomCategories: [],
     LiveConfig: [],
+    PanSouConfig: getDefaultPanSouConfig(),
+    TMDBConfig: {
+      ApiKey: process.env.TMDB_API_KEY || '',
+      ProxyType: process.env.TMDB_REVERSE_PROXY
+        ? 'reverse'
+        : process.env.TMDB_PROXY
+          ? 'forward'
+          : 'direct',
+      Proxy: process.env.TMDB_PROXY || '',
+      ReverseProxy: process.env.TMDB_REVERSE_PROXY || '',
+    },
+    PrivateLibraryConfig: {
+      connectors: [],
+    },
+    AdFilterConfig: {
+      enabled: true,
+    },
   };
   return adminConfig;
 }
 
 export async function getConfig(): Promise<AdminConfig> {
-  // 直接使用内存缓存
-  if (cachedConfig) {
-    return cachedConfig;
-  }
-
-  // 读 db
   let adminConfig: AdminConfig | null = null;
   try {
     adminConfig = await db.getAdminConfig();
   } catch (e) {
     console.error('获取管理员配置失败:', e);
+    if (cachedConfig) {
+      return cachedConfig;
+    }
   }
 
   // db 中无配置，执行一次初始化
   if (!adminConfig) {
-    adminConfig = await getInitConfig('');
+    const initConfig = await getInitConfig('');
+    return saveAdminConfigWithVerification(initConfig);
   }
-  adminConfig = configSelfCheck(adminConfig);
-  cachedConfig = adminConfig;
-  // 🐛 修复: 确保配置保存完成后再返回
-  await db.saveAdminConfig(cachedConfig);
-  return cachedConfig;
+
+  const originalConfigSnapshot = JSON.stringify(
+    normalizeForComparison(adminConfig),
+  );
+  const checkedConfig = configSelfCheck(adminConfig);
+  if (
+    JSON.stringify(normalizeForComparison(checkedConfig)) !==
+    originalConfigSnapshot
+  ) {
+    return saveAdminConfigWithVerification(checkedConfig);
+  }
+
+  cachedConfig = checkedConfig;
+  return checkedConfig;
 }
 
 export function configSelfCheck(adminConfig: AdminConfig): AdminConfig {
+  if (!adminConfig.SiteConfig) {
+    adminConfig.SiteConfig = getLocalModeConfig().SiteConfig;
+  }
+
+  if (typeof adminConfig.SiteConfig.DoubanProxyType !== 'string') {
+    adminConfig.SiteConfig.DoubanProxyType =
+      process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'auto';
+  }
+
+  if (typeof adminConfig.SiteConfig.DoubanProxy !== 'string') {
+    adminConfig.SiteConfig.DoubanProxy =
+      process.env.NEXT_PUBLIC_DOUBAN_PROXY || '';
+  }
+
+  if (typeof adminConfig.SiteConfig.DoubanImageProxyType !== 'string') {
+    adminConfig.SiteConfig.DoubanImageProxyType =
+      process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE || 'auto';
+  }
+
+  if (typeof adminConfig.SiteConfig.DoubanImageProxy !== 'string') {
+    adminConfig.SiteConfig.DoubanImageProxy =
+      process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY || '';
+  }
+
+  if (!adminConfig.SiteConfig.TmdbProxyType) {
+    adminConfig.SiteConfig.TmdbProxyType = process.env.TMDB_REVERSE_PROXY
+      ? 'reverse'
+      : process.env.TMDB_PROXY
+        ? 'forward'
+        : 'direct';
+  }
+
+  if (typeof adminConfig.SiteConfig.TmdbProxy !== 'string') {
+    adminConfig.SiteConfig.TmdbProxy = process.env.TMDB_PROXY || '';
+  }
+
+  if (typeof adminConfig.SiteConfig.TmdbReverseProxy !== 'string') {
+    adminConfig.SiteConfig.TmdbReverseProxy =
+      process.env.TMDB_REVERSE_PROXY || '';
+  }
+
   // 确保必要的属性存在和初始化
+  if (
+    adminConfig.SiteConfig.SearchResultLoadMode !== 'pagination' &&
+    adminConfig.SiteConfig.SearchResultLoadMode !== 'infinite'
+  ) {
+    adminConfig.SiteConfig.SearchResultLoadMode =
+      getDefaultSearchResultLoadMode();
+  }
+
   if (!adminConfig.UserConfig) {
-    adminConfig.UserConfig = { Users: [] };
+    adminConfig.UserConfig = {
+      RegistrationEnabled: getDefaultRegistrationEnabled(),
+      RegistrationDefaultUserGroup: getDefaultRegistrationUserGroup(),
+      Users: [],
+    };
+  }
+  if (typeof adminConfig.UserConfig.RegistrationEnabled !== 'boolean') {
+    adminConfig.UserConfig.RegistrationEnabled =
+      getDefaultRegistrationEnabled();
+  }
+  if (typeof adminConfig.UserConfig.RegistrationDefaultUserGroup !== 'string') {
+    adminConfig.UserConfig.RegistrationDefaultUserGroup =
+      getDefaultRegistrationUserGroup();
   }
   if (
     !adminConfig.UserConfig.Users ||
@@ -392,6 +592,25 @@ export function configSelfCheck(adminConfig: AdminConfig): AdminConfig {
   if (!adminConfig.LiveConfig || !Array.isArray(adminConfig.LiveConfig)) {
     adminConfig.LiveConfig = [];
   }
+
+  if (!adminConfig.TMDBConfig || typeof adminConfig.TMDBConfig !== 'object') {
+    adminConfig.TMDBConfig = {
+      ApiKey: process.env.TMDB_API_KEY || '',
+      ProxyType: process.env.TMDB_REVERSE_PROXY
+        ? 'reverse'
+        : process.env.TMDB_PROXY
+          ? 'forward'
+          : 'direct',
+      Proxy: process.env.TMDB_PROXY || '',
+      ReverseProxy: process.env.TMDB_REVERSE_PROXY || '',
+    };
+  }
+
+  adminConfig.PrivateLibraryConfig = normalizePrivateLibraryConfig(
+    adminConfig.PrivateLibraryConfig,
+  );
+
+  adminConfig.PanSouConfig = normalizePanSouConfig(adminConfig.PanSouConfig);
 
   // 站长变更自检
   const ownerUser = process.env.USERNAME;
@@ -476,8 +695,7 @@ export async function resetConfig() {
     originConfig.ConfigFile,
     originConfig.ConfigSubscribtion,
   );
-  cachedConfig = adminConfig;
-  await db.saveAdminConfig(adminConfig);
+  await saveAdminConfigWithVerification(adminConfig);
 
   return;
 }
@@ -511,6 +729,7 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
         api: s.api,
         detail: s.detail,
         is_adult: s.is_adult,
+        disable_ad_filter: s.disable_ad_filter,
       }));
   }
 
@@ -537,6 +756,7 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
           api: s.api,
           detail: s.detail,
           is_adult: s.is_adult,
+          disable_ad_filter: s.disable_ad_filter,
         }));
     }
   }

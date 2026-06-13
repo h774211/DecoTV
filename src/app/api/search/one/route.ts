@@ -1,23 +1,36 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { resolveAdultFilter } from '@/lib/adult-filter';
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { getAuthInfoFromCookie, verifyApiAuth } from '@/lib/auth';
 import { getAvailableApiSites, getCacheTime, getConfig } from '@/lib/config';
 import { searchFromApi } from '@/lib/downstream';
+import { rewriteEpisodesForAdFilterMany } from '@/lib/episode-rewriter';
+import {
+  buildResolutionFilterFromSearchParams,
+  filterSearchResultsByResolution,
+  formatResolutionLabel,
+} from '@/lib/video-quality';
 import { yellowWords } from '@/lib/yellow';
 
 export const runtime = 'nodejs';
 
 // OrionTV 兼容接口
 export async function GET(request: NextRequest) {
-  const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
+  // 使用统一的认证函数，支持本地模式和数据库模式
+  const authResult = verifyApiAuth(request);
+  if (!authResult.isValid) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+
+  // 获取用户名（本地模式可能没有 username）
+  const authInfo = getAuthInfoFromCookie(request);
+  const username =
+    authInfo?.username || (authResult.isLocalMode ? '__local__' : '');
 
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
   const resourceId = searchParams.get('resourceId');
+  const resolutionFilter = buildResolutionFilterFromSearchParams(searchParams);
 
   if (!query || !resourceId) {
     const cacheTime = await getCacheTime();
@@ -35,7 +48,7 @@ export async function GET(request: NextRequest) {
   }
 
   const config = await getConfig();
-  let apiSites = await getAvailableApiSites(authInfo.username);
+  let apiSites = await getAvailableApiSites(username);
 
   const shouldFilterAdult = resolveAdultFilter(
     searchParams,
@@ -79,6 +92,7 @@ export async function GET(request: NextRequest) {
         return !yellowWords.some((word: string) => typeName.includes(word));
       });
     }
+    result = filterSearchResultsByResolution(result, resolutionFilter);
     const cacheTime = await getCacheTime();
 
     if (result.length === 0) {
@@ -94,12 +108,17 @@ export async function GET(request: NextRequest) {
             'Access-Control-Allow-Methods': 'GET, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Cookie',
             'X-Adult-Filter': shouldFilterAdult ? 'enabled' : 'disabled',
+            'X-Min-Resolution': resolutionFilter.minLevel
+              ? formatResolutionLabel(resolutionFilter.minLevel)
+              : 'off',
+            'X-Resolution-Strict': resolutionFilter.strict ? 'true' : 'false',
           },
         },
       );
     } else {
+      const rewritten = await rewriteEpisodesForAdFilterMany(result, request);
       return NextResponse.json(
-        { results: result },
+        { results: rewritten },
         {
           headers: {
             'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}`,
@@ -110,6 +129,10 @@ export async function GET(request: NextRequest) {
             'Access-Control-Allow-Methods': 'GET, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Cookie',
             'X-Adult-Filter': shouldFilterAdult ? 'enabled' : 'disabled',
+            'X-Min-Resolution': resolutionFilter.minLevel
+              ? formatResolutionLabel(resolutionFilter.minLevel)
+              : 'off',
+            'X-Resolution-Strict': resolutionFilter.strict ? 'true' : 'false',
           },
         },
       );

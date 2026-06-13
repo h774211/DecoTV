@@ -2,7 +2,8 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
+import { verifyApiAuth } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
 import { db } from '@/lib/db';
 
@@ -21,16 +22,15 @@ const ACTIONS = [
   'userGroup',
   'updateUserGroups',
   'batchUpdateUserGroups',
+  'updateRegistrationSettings',
 ] as const;
 
 export async function POST(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-  const hasRedis = !!(process.env.REDIS_URL || process.env.KV_REST_API_URL);
-  const isLocalMode = storageType === 'localstorage' && !hasRedis;
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
 
-  // 🔐 本地模式（无数据库）：跳过认证，返回成功
-  // 安全性说明：仅当没有配置任何数据库时才启用此模式
-  if (isLocalMode) {
+  // 本地模式（无数据库）：跳过认证，返回成功
+  if (authResult.isLocalMode) {
     return NextResponse.json(
       {
         ok: true,
@@ -41,14 +41,19 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // 认证失败
+  if (!authResult.isValid) {
+    console.log('[admin/user] 认证失败:', {
+      hasAuth: !!request.cookies.get('auth'),
+      isLocalMode: authResult.isLocalMode,
+    });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = await request.json();
 
-    const authInfo = getAuthInfoFromCookie(request);
-    if (!authInfo || !authInfo.username) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-    const username = authInfo.username;
+    const username = authResult.username;
 
     const {
       targetUsername, // 目标用户名
@@ -67,7 +72,11 @@ export async function POST(request: NextRequest) {
     // 用户组操作和批量操作不需要targetUsername
     if (
       !targetUsername &&
-      !['userGroup', 'batchUpdateUserGroups'].includes(action)
+      ![
+        'userGroup',
+        'batchUpdateUserGroups',
+        'updateRegistrationSettings',
+      ].includes(action)
     ) {
       return NextResponse.json({ error: '缺少目标用户名' }, { status: 400 });
     }
@@ -109,7 +118,11 @@ export async function POST(request: NextRequest) {
     let isTargetAdmin = false;
 
     if (
-      !['userGroup', 'batchUpdateUserGroups'].includes(action) &&
+      ![
+        'userGroup',
+        'batchUpdateUserGroups',
+        'updateRegistrationSettings',
+      ].includes(action) &&
       targetUsername
     ) {
       targetEntry = adminConfig.UserConfig.Users.find(
@@ -340,6 +353,56 @@ export async function POST(request: NextRequest) {
 
         break;
       }
+      case 'updateRegistrationSettings': {
+        if (operatorRole !== 'owner') {
+          return NextResponse.json(
+            { error: '仅站长可以调整公开注册设置' },
+            { status: 403 },
+          );
+        }
+
+        const { registrationEnabled, registrationDefaultUserGroup } = body as {
+          registrationEnabled?: boolean;
+          registrationDefaultUserGroup?: string;
+        };
+        if (
+          typeof registrationEnabled !== 'boolean' ||
+          typeof registrationDefaultUserGroup !== 'string'
+        ) {
+          return NextResponse.json(
+            { error: '注册设置格式错误' },
+            { status: 400 },
+          );
+        }
+        if (
+          registrationEnabled &&
+          (process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage') ===
+            'localstorage'
+        ) {
+          return NextResponse.json(
+            { error: '当前存储模式不支持开启用户注册' },
+            { status: 400 },
+          );
+        }
+
+        const defaultUserGroup = registrationDefaultUserGroup.trim();
+        if (
+          registrationEnabled &&
+          defaultUserGroup &&
+          !adminConfig.UserConfig.Tags?.some(
+            (tag) => tag.name === defaultUserGroup,
+          )
+        ) {
+          return NextResponse.json(
+            { error: '默认注册用户组不存在，请先创建该用户组' },
+            { status: 400 },
+          );
+        }
+
+        adminConfig.UserConfig.RegistrationEnabled = registrationEnabled;
+        adminConfig.UserConfig.RegistrationDefaultUserGroup = defaultUserGroup;
+        break;
+      }
       case 'userGroup': {
         // 用户组管理操作
         const { groupAction, groupName, enabledApis } = body as {
@@ -408,6 +471,11 @@ export async function POST(request: NextRequest) {
 
             // 删除用户组
             adminConfig.UserConfig.Tags.splice(groupIndex, 1);
+            if (
+              adminConfig.UserConfig.RegistrationDefaultUserGroup === groupName
+            ) {
+              adminConfig.UserConfig.RegistrationDefaultUserGroup = '';
+            }
 
             // 记录删除操作的影响
             console.log(
@@ -509,8 +577,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: '未知操作' }, { status: 400 });
     }
 
-    // 将更新后的配置写入数据库
-    await db.saveAdminConfig(adminConfig);
+    await persistAdminConfigMutation(adminConfig);
 
     return NextResponse.json(
       { ok: true },

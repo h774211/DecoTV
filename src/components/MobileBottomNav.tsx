@@ -1,11 +1,22 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 'use client';
 
-import { Cat, Clover, Film, Home, Radio, Search, Star, Tv } from 'lucide-react';
+import {
+  Cat,
+  Cloud,
+  Clover,
+  Film,
+  Home,
+  Library,
+  Radio,
+  Search,
+  Star,
+  Tv,
+} from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { ComponentType, useCallback, useEffect, useRef, useState } from 'react';
+
+import SourceBrowserIcon from './icons/SourceBrowserIcon';
 
 // 简单的 className 合并函数
 function cn(...classes: (string | boolean | undefined | null)[]): string {
@@ -13,7 +24,7 @@ function cn(...classes: (string | boolean | undefined | null)[]): string {
 }
 
 interface NavItem {
-  icon: typeof Home;
+  icon: ComponentType<{ className?: string }>;
   label: string;
   href: string;
   // 选中状态的渐变色配置
@@ -62,6 +73,22 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
       hoverBg: 'hover:bg-blue-500/20',
     },
     {
+      icon: SourceBrowserIcon,
+      label: '源浏览器',
+      href: '/source-browser',
+      activeGradient: 'bg-linear-to-r from-emerald-500 to-teal-500',
+      activeTextColor: 'text-white',
+      hoverBg: 'hover:bg-emerald-500/20',
+    },
+    {
+      icon: Cloud,
+      label: '网盘',
+      href: '/netdisk',
+      activeGradient: 'bg-linear-to-r from-sky-500 to-teal-500',
+      activeTextColor: 'text-white',
+      hoverBg: 'hover:bg-sky-500/20',
+    },
+    {
       icon: Film,
       label: '电影',
       href: '/douban?type=movie',
@@ -105,8 +132,11 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
 
   // 动态添加自定义分类
   useEffect(() => {
-    const runtimeConfig = (window as any).RUNTIME_CONFIG;
-    if (runtimeConfig?.CUSTOM_CATEGORIES?.length > 0) {
+    const runtimeConfig = window.RUNTIME_CONFIG;
+    if (
+      Array.isArray(runtimeConfig?.CUSTOM_CATEGORIES) &&
+      runtimeConfig.CUSTOM_CATEGORIES.length > 0
+    ) {
       setNavItems((prevItems) => {
         // 防止重复添加
         if (prevItems.some((item) => item.label === '自定义')) return prevItems;
@@ -119,6 +149,25 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
             activeGradient: 'bg-linear-to-r from-yellow-400 to-amber-500',
             activeTextColor: 'text-white',
             hoverBg: 'hover:bg-yellow-500/20',
+          },
+        ];
+      });
+    }
+
+    if (runtimeConfig?.PRIVATE_LIBRARY_ENABLED) {
+      setNavItems((prevItems) => {
+        if (prevItems.some((item) => item.href === '/my-library')) {
+          return prevItems;
+        }
+        return [
+          ...prevItems,
+          {
+            icon: Library,
+            label: '我的影库',
+            href: '/my-library',
+            activeGradient: 'bg-linear-to-r from-indigo-500 to-blue-600',
+            activeTextColor: 'text-white',
+            hoverBg: 'hover:bg-indigo-500/20',
           },
         ];
       });
@@ -142,8 +191,17 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
       if (href === '/search' && decodedActive.startsWith('/search'))
         return true;
 
+      // 网盘页特殊处理
+      if (href === '/netdisk' && decodedActive.startsWith('/netdisk'))
+        return true;
+
       // 直播页特殊处理
       if (href === '/live' && decodedActive.startsWith('/live')) return true;
+
+      // 我的影库特殊处理
+      if (href === '/my-library' && decodedActive.startsWith('/my-library')) {
+        return true;
+      }
 
       // 豆瓣分类匹配
       if (
@@ -190,10 +248,10 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
         'w-auto max-w-[92vw]',
         // 外观样式 - 磨砂玻璃胶囊 (亮色/暗色自适应)
         'rounded-full',
-        'bg-white/80 dark:bg-black/75',
-        'backdrop-blur-xl',
+        'bg-white/92 dark:bg-black/90',
+        'backdrop-blur-[6px]',
         'border border-black/5 dark:border-white/10',
-        'shadow-xl shadow-black/5 dark:shadow-2xl dark:shadow-black/40',
+        'shadow-lg shadow-black/8 dark:shadow-xl dark:shadow-black/35',
       )}
       style={{
         // 距离底部安全区

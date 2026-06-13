@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 
 import { getCacheTime } from '@/lib/config';
-import { fetchDoubanData } from '@/lib/douban';
+import {
+  fetchDoubanJson,
+  isDoubanFetchError,
+  resolveServerDoubanProxyConfig,
+} from '@/lib/douban-proxy';
 import { DoubanItem, DoubanResult } from '@/lib/types';
 
 interface DoubanCategoryApiResponse {
@@ -36,36 +40,46 @@ export async function GET(request: Request) {
   if (!kind || !category || !type) {
     return NextResponse.json(
       { error: '缺少必要参数: kind 或 category 或 type' },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
   if (!['tv', 'movie'].includes(kind)) {
     return NextResponse.json(
       { error: 'kind 参数必须是 tv 或 movie' },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
   if (pageLimit < 1 || pageLimit > 100) {
     return NextResponse.json(
       { error: 'pageSize 必须在 1-100 之间' },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
   if (pageStart < 0) {
     return NextResponse.json(
       { error: 'pageStart 不能小于 0' },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
-  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?start=${pageStart}&limit=${pageLimit}&category=${category}&type=${type}`;
+  const targetParams = new URLSearchParams({
+    start: pageStart.toString(),
+    limit: pageLimit.toString(),
+    category,
+    type,
+  });
+  const target = `https://m.douban.com/rexxar/api/v2/subject/recent_hot/${kind}?${targetParams.toString()}`;
 
   try {
-    // 调用豆瓣 API
-    const doubanData = await fetchDoubanData<DoubanCategoryApiResponse>(target);
+    const proxyConfig = await resolveServerDoubanProxyConfig(request);
+    const doubanResult = await fetchDoubanJson<DoubanCategoryApiResponse>(
+      target,
+      proxyConfig,
+    );
+    const doubanData = doubanResult.data;
 
     // 转换数据格式
     const list: DoubanItem[] = doubanData.items.map((item) => ({
@@ -89,12 +103,20 @@ export async function GET(request: Request) {
         'CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
         'Vercel-CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
         'Netlify-Vary': 'query',
+        'X-DecoTV-Douban-Provider': doubanResult.provider,
+        'X-DecoTV-Douban-Duration': doubanResult.durationMs.toString(),
       },
     });
   } catch (error) {
     return NextResponse.json(
-      { error: '获取豆瓣数据失败', details: (error as Error).message },
-      { status: 500 }
+      {
+        error: '获取豆瓣数据失败',
+        details: (error as Error).message,
+        providerAttempts: isDoubanFetchError(error)
+          ? error.attempts
+          : undefined,
+      },
+      { status: 500 },
     );
   }
 }

@@ -1,7 +1,8 @@
 /* eslint-disable no-console */
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getConfig, setCachedConfig } from '@/lib/config';
+import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
+import { getConfig } from '@/lib/config';
 import { db } from '@/lib/db';
 
 export const runtime = 'nodejs';
@@ -134,6 +135,20 @@ export async function GET(req: NextRequest) {
     const action = searchParams.get('action');
 
     if (action === 'captcha') {
+      const config = await getConfig();
+      if (!config.UserConfig.RegistrationEnabled) {
+        return NextResponse.json({ error: '注册功能未开启' }, { status: 403 });
+      }
+
+      const storageType =
+        process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
+      if (storageType === 'localstorage') {
+        return NextResponse.json(
+          { error: '当前存储模式不支持用户注册，请使用 Redis/Upstash/Kvrocks' },
+          { status: 400 },
+        );
+      }
+
       // 生成验证码
       const code = generateCaptcha();
       const sessionId = Math.random().toString(36).substring(2, 15);
@@ -159,7 +174,7 @@ export async function GET(req: NextRequest) {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-store, no-cache, must-revalidate',
           },
-        }
+        },
       );
     }
 
@@ -174,9 +189,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     // 检查是否启用注册功能
-    const registrationEnabled =
-      process.env.NEXT_PUBLIC_ENABLE_REGISTRATION === 'true';
-    if (!registrationEnabled) {
+    const config = await getConfig();
+    if (!config.UserConfig.RegistrationEnabled) {
       return NextResponse.json({ error: '注册功能未开启' }, { status: 403 });
     }
 
@@ -185,7 +199,7 @@ export async function POST(req: NextRequest) {
     if (storageType === 'localstorage') {
       return NextResponse.json(
         { error: '当前存储模式不支持用户注册，请使用 Redis/Upstash/Kvrocks' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -202,7 +216,7 @@ export async function POST(req: NextRequest) {
     if (!captchaData) {
       return NextResponse.json(
         { error: '验证码已过期，请刷新' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -211,7 +225,7 @@ export async function POST(req: NextRequest) {
       captchaStore.delete(sessionId);
       return NextResponse.json(
         { error: '验证码错误次数过多，请重新获取' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -220,7 +234,7 @@ export async function POST(req: NextRequest) {
       captchaData.attempts += 1;
       return NextResponse.json(
         { error: '验证码错误，请重试' },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -253,26 +267,57 @@ export async function POST(req: NextRequest) {
     // 注册用户到数据库
     await db.registerUser(username, password);
 
-    // 获取配置并添加到用户列表
-    const config = await getConfig();
-
     // 检查是否已在配置中（理论上不应该存在）
     const existsInConfig = config.UserConfig.Users.some(
-      (u) => u.username === username
+      (u) => u.username === username,
     );
 
     if (!existsInConfig) {
-      // 添加到用户配置
-      config.UserConfig.Users.push({
+      // 获取后台配置的默认用户组设置
+      const defaultUserGroup =
+        config.UserConfig.RegistrationDefaultUserGroup.trim();
+
+      // 验证默认用户组是否存在于配置中
+      let validDefaultGroup: string | undefined;
+      if (defaultUserGroup && config.UserConfig.Tags) {
+        const groupExists = config.UserConfig.Tags.some(
+          (tag) => tag.name === defaultUserGroup,
+        );
+        if (groupExists) {
+          validDefaultGroup = defaultUserGroup;
+        } else {
+          console.warn(
+            `默认注册用户组 "${defaultUserGroup}" 不存在，将不分配用户组`,
+          );
+        }
+      }
+
+      // 构建新用户对象
+      const newUser: {
+        username: string;
+        role: 'user';
+        banned: boolean;
+        tags?: string[];
+      } = {
         username,
         role: 'user', // 新注册用户默认为普通用户
         banned: false,
-      });
+      };
+
+      // 如果有有效的默认用户组，添加到 tags
+      if (validDefaultGroup) {
+        newUser.tags = [validDefaultGroup];
+        console.log(
+          `新用户 "${username}" 已分配到默认用户组: ${validDefaultGroup}`,
+        );
+      }
+
+      // 添加到用户配置
+      config.UserConfig.Users.push(newUser);
 
       // 保存配置
       try {
-        await db.saveAdminConfig(config);
-        await setCachedConfig(config);
+        await persistAdminConfigMutation(config);
       } catch (error) {
         console.error('保存用户配置异常:', error);
         // 不影响注册流程
@@ -291,7 +336,7 @@ export async function POST(req: NextRequest) {
       {
         error: error instanceof Error ? error.message : '注册失败，请稍后重试',
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

@@ -1,11 +1,11 @@
-/* eslint-disable react-hooks/exhaustive-deps, @typescript-eslint/no-explicit-any,@typescript-eslint/no-non-null-assertion,no-empty */
+/* eslint-disable react-hooks/exhaustive-deps, @typescript-eslint/no-explicit-any,@typescript-eslint/no-non-null-assertion,no-empty,no-console */
 'use client';
 
-import { ChevronUp, Search, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronUp, Search, X } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import React, {
-  startTransition,
   Suspense,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -20,13 +20,128 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
+import { normalizeResolutionLevel } from '@/lib/video-quality';
 
+import ErrorBoundary from '@/components/ErrorBoundary';
 import PageLayout from '@/components/PageLayout';
 import SearchResultFilter, {
   SearchFilterCategory,
 } from '@/components/SearchResultFilter';
 import SearchSuggestions from '@/components/SearchSuggestions';
 import VideoCard, { VideoCardHandle } from '@/components/VideoCard';
+import VirtualizedVideoGrid from '@/components/VirtualizedVideoGrid';
+
+type SafeSearchState = {
+  data: SearchResult[];
+  isLoading: boolean;
+  hasError: boolean;
+  normalizedQuery: string;
+  totalSources: number;
+  completedSources: number;
+};
+
+type SearchResultLoadMode = 'infinite' | 'pagination';
+
+const SEARCH_RESULT_PAGE_SIZE = 48;
+
+function isValidSearchResult(item: unknown): item is SearchResult {
+  if (!item || typeof item !== 'object') return false;
+  const record = item as Partial<SearchResult>;
+  return Boolean(record.id && record.title);
+}
+
+function sanitizeSearchResults(results: unknown): SearchResult[] {
+  if (!Array.isArray(results)) return [];
+  return results.filter(isValidSearchResult);
+}
+
+function createSafeSearchState(
+  overrides: Partial<SafeSearchState> = {},
+): SafeSearchState {
+  return {
+    data: sanitizeSearchResults(overrides.data ?? []),
+    isLoading: Boolean(overrides.isLoading),
+    hasError: Boolean(overrides.hasError),
+    normalizedQuery:
+      typeof overrides.normalizedQuery === 'string'
+        ? overrides.normalizedQuery
+        : '',
+    totalSources:
+      typeof overrides.totalSources === 'number' &&
+      Number.isFinite(overrides.totalSources)
+        ? overrides.totalSources
+        : 0,
+    completedSources:
+      typeof overrides.completedSources === 'number' &&
+      Number.isFinite(overrides.completedSources)
+        ? overrides.completedSources
+        : 0,
+  };
+}
+
+function SearchResultPagination({
+  currentPage,
+  totalPages,
+  onPageChange,
+}: {
+  currentPage: number;
+  totalPages: number;
+  onPageChange: (page: number) => void;
+}) {
+  if (totalPages <= 1) return null;
+
+  return (
+    <nav
+      aria-label='搜索结果分页'
+      className='mt-10 flex flex-wrap items-center justify-center gap-3'
+    >
+      <button
+        type='button'
+        disabled={currentPage <= 1}
+        onClick={() => onPageChange(currentPage - 1)}
+        className='inline-flex h-9 items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-3 text-sm text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'
+      >
+        <ChevronLeft className='h-4 w-4' />
+        上一页
+      </button>
+      <span className='text-sm text-gray-500 dark:text-gray-400'>
+        第 {currentPage} / {totalPages} 页
+      </span>
+      <button
+        type='button'
+        disabled={currentPage >= totalPages}
+        onClick={() => onPageChange(currentPage + 1)}
+        className='inline-flex h-9 items-center gap-1.5 rounded-lg border border-gray-300 bg-white px-3 text-sm text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700'
+      >
+        下一页
+        <ChevronRight className='h-4 w-4' />
+      </button>
+    </nav>
+  );
+}
+
+const SearchResultLoadMoreSentinel = React.forwardRef<
+  HTMLDivElement,
+  { hasMore: boolean }
+>(({ hasMore }, ref) => {
+  if (!hasMore) return null;
+
+  return (
+    <div
+      ref={ref}
+      className='mt-8 flex min-h-12 items-center justify-center gap-2 text-sm text-gray-500 dark:text-gray-400'
+      aria-live='polite'
+    >
+      <span
+        className='inline-block h-4 w-4 animate-spin rounded-full border-2 border-gray-300 border-t-green-500'
+        aria-hidden='true'
+      />
+      下滑加载更多
+    </div>
+  );
+});
+
+SearchResultLoadMoreSentinel.displayName = 'SearchResultLoadMoreSentinel';
 
 function SearchPageClient() {
   // 搜索历史
@@ -40,15 +155,26 @@ function SearchPageClient() {
   const [searchQuery, setSearchQuery] = useState('');
   const [normalizedQuery, setNormalizedQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [hasSearchError, setHasSearchError] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const [totalSources, setTotalSources] = useState(0);
   const [completedSources, setCompletedSources] = useState(0);
+  const searchResultsRef = useRef<SearchResult[]>([]);
   const pendingResultsRef = useRef<SearchResult[]>([]);
   const flushTimerRef = useRef<number | null>(null);
+  const backToTopRafRef = useRef<number | null>(null);
   const [useFluidSearch, setUseFluidSearch] = useState(true);
+  const [resultLoadMode, setResultLoadMode] =
+    useState<SearchResultLoadMode>('infinite');
+  const [visibleResultCount, setVisibleResultCount] = useState(
+    SEARCH_RESULT_PAGE_SIZE,
+  );
+  const [currentResultPage, setCurrentResultPage] = useState(1);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const resultsSectionRef = useRef<HTMLElement | null>(null);
   // 聚合卡片 refs 与聚合统计缓存
   const groupRefs = useRef<
     Map<string, React.RefObject<VideoCardHandle | null>>
@@ -59,6 +185,53 @@ function SearchPageClient() {
       { douban_id?: number; episodes?: number; source_names: string[] }
     >
   >(new Map());
+
+  const setSafeSearchResults = useCallback(
+    (
+      value:
+        | SearchResult[]
+        | ((previous: SearchResult[]) => SearchResult[] | unknown),
+    ) => {
+      setSearchResults((previous) => {
+        const safePrevious = sanitizeSearchResults(previous);
+        const nextValue =
+          typeof value === 'function'
+            ? (value as (previous: SearchResult[]) => SearchResult[] | unknown)(
+                safePrevious,
+              )
+            : value;
+        const safeNext = sanitizeSearchResults(nextValue);
+        searchResultsRef.current = safeNext;
+        return safeNext;
+      });
+    },
+    [],
+  );
+
+  const applySafeSearchState = useCallback(
+    (state: SafeSearchState) => {
+      setSafeSearchResults(state.data);
+      setIsLoading(state.isLoading);
+      setHasSearchError(state.hasError);
+      setNormalizedQuery(state.normalizedQuery);
+      setTotalSources(state.totalSources);
+      setCompletedSources(state.completedSources);
+    },
+    [setSafeSearchResults],
+  );
+
+  const flushPendingResults = useCallback(() => {
+    if (pendingResultsRef.current.length === 0) return;
+
+    const toAppend = pendingResultsRef.current;
+    pendingResultsRef.current = [];
+    if (flushTimerRef.current) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+
+    setSafeSearchResults((previous) => previous.concat(toAppend));
+  }, [setSafeSearchResults]);
 
   const getGroupRef = (key: string) => {
     let ref = groupRefs.current.get(key);
@@ -115,22 +288,26 @@ function SearchPageClient() {
     source: string;
     title: string;
     year: string;
+    resolution: string;
     yearOrder: 'none' | 'asc' | 'desc';
   }>({
     source: 'all',
     title: 'all',
     year: 'all',
+    resolution: 'all',
     yearOrder: 'none',
   });
   const [filterAgg, setFilterAgg] = useState<{
     source: string;
     title: string;
     year: string;
+    resolution: string;
     yearOrder: 'none' | 'asc' | 'desc';
   }>({
     source: 'all',
     title: 'all',
     year: 'all',
+    resolution: 'all',
     yearOrder: 'none',
   });
 
@@ -194,86 +371,116 @@ function SearchPageClient() {
     return order === 'asc' ? aNum - bNum : bNum - aNum;
   };
 
+  const getResolutionLevel = (item: SearchResult) => {
+    return (
+      normalizeResolutionLevel(item.resolution_level) ||
+      normalizeResolutionLevel(item.resolution)
+    );
+  };
+
+  const matchesResolutionFilter = (item: SearchResult, resolution: string) => {
+    if (resolution === 'all') return true;
+
+    const level = getResolutionLevel(item);
+    if (resolution === 'unknown') return level === 0;
+
+    const minLevel = normalizeResolutionLevel(resolution);
+    if (!minLevel) return true;
+    return level >= minLevel;
+  };
+
   // 聚合后的结果（按标题和年份分组）
   // ✨ 只聚合相关度较高的结果（标题包含关键词或模糊匹配）
   const aggregatedResults = useMemo(() => {
-    const query = currentQueryRef.current.trim().toLowerCase();
-    const queryNoSpace = query.replace(/\s+/g, '');
+    try {
+      // NOTE: 防御性校验 —— 确保 searchResults 是有效数组
+      const safeResults = Array.isArray(searchResults) ? searchResults : [];
+      if (safeResults.length === 0) return [];
 
-    const normQuery = normalizedQuery
-      ? normalizedQuery.trim().toLowerCase()
-      : query;
-    const normQueryNoSpace = normQuery.replace(/\s+/g, '');
+      const query = currentQueryRef.current.trim().toLowerCase();
+      const queryNoSpace = query.replace(/\s+/g, '');
 
-    // 过滤：只保留标题相关的结果
-    const relevantResults = searchResults.filter((item) => {
-      const title = item.title.toLowerCase();
-      const titleNoSpace = title.replace(/\s+/g, '');
+      const normQuery = normalizedQuery
+        ? normalizedQuery.trim().toLowerCase()
+        : query;
+      const normQueryNoSpace = normQuery.replace(/\s+/g, '');
 
-      // 包含完整关键词 (检查原词和转换后的词)
-      if (
-        title.includes(query) ||
-        titleNoSpace.includes(queryNoSpace) ||
-        title.includes(normQuery) ||
-        titleNoSpace.includes(normQueryNoSpace)
-      ) {
-        return true;
-      }
+      // 过滤：只保留标题相关的结果
+      // NOTE: 上游 API 可能返回 title/episodes 为 null 的残缺数据，先过滤再处理
+      const relevantResults = safeResults.filter((item) => {
+        if (!item || !item.title) return false;
+        const title = (item.title || '').toLowerCase();
+        const titleNoSpace = title.replace(/\s+/g, '');
 
-      // 顺序包含关键词的所有字符 (检查原词)
-      let queryIndex = 0;
-      for (
-        let i = 0;
-        i < titleNoSpace.length && queryIndex < queryNoSpace.length;
-        i++
-      ) {
-        if (titleNoSpace[i] === queryNoSpace[queryIndex]) {
-          queryIndex++;
+        // 包含完整关键词 (检查原词和转换后的词)
+        if (
+          title.includes(query) ||
+          titleNoSpace.includes(queryNoSpace) ||
+          title.includes(normQuery) ||
+          titleNoSpace.includes(normQueryNoSpace)
+        ) {
+          return true;
         }
-      }
-      if (queryIndex === queryNoSpace.length) return true;
 
-      // 顺序包含关键词的所有字符 (检查转换后的词)
-      if (normQuery !== query) {
-        let normIndex = 0;
+        // 顺序包含关键词的所有字符 (检查原词)
+        let queryIndex = 0;
         for (
           let i = 0;
-          i < titleNoSpace.length && normIndex < normQueryNoSpace.length;
+          i < titleNoSpace.length && queryIndex < queryNoSpace.length;
           i++
         ) {
-          if (titleNoSpace[i] === normQueryNoSpace[normIndex]) {
-            normIndex++;
+          if (titleNoSpace[i] === queryNoSpace[queryIndex]) {
+            queryIndex++;
           }
         }
-        if (normIndex === normQueryNoSpace.length) return true;
-      }
+        if (queryIndex === queryNoSpace.length) return true;
 
-      return false;
-    });
+        // 顺序包含关键词的所有字符 (检查转换后的词)
+        if (normQuery !== query) {
+          let normIndex = 0;
+          for (
+            let i = 0;
+            i < titleNoSpace.length && normIndex < normQueryNoSpace.length;
+            i++
+          ) {
+            if (titleNoSpace[i] === normQueryNoSpace[normIndex]) {
+              normIndex++;
+            }
+          }
+          if (normIndex === normQueryNoSpace.length) return true;
+        }
 
-    const map = new Map<string, SearchResult[]>();
-    const keyOrder: string[] = []; // 记录键出现的顺序
+        return false;
+      });
 
-    relevantResults.forEach((item) => {
-      // 使用 title + year + type 作为键，year 必然存在，但依然兜底 'unknown'
-      const key = `${item.title.replaceAll(' ', '')}-${
-        item.year || 'unknown'
-      }-${item.episodes.length === 1 ? 'movie' : 'tv'}`;
-      const arr = map.get(key) || [];
+      const map = new Map<string, SearchResult[]>();
+      const keyOrder: string[] = []; // 记录键出现的顺序
 
-      // 如果是新的键，记录其顺序
-      if (arr.length === 0) {
-        keyOrder.push(key);
-      }
+      relevantResults.forEach((item) => {
+        // 使用 title + year + type 作为键，year 必然存在，但依然兜底 'unknown'
+        const key = `${(item.title || '').replaceAll(' ', '')}-${
+          item.year || 'unknown'
+        }-${(item.episodes?.length ?? 0) === 1 ? 'movie' : 'tv'}`;
+        const arr = map.get(key) || [];
 
-      arr.push(item);
-      map.set(key, arr);
-    });
+        // 如果是新的键，记录其顺序
+        if (arr.length === 0) {
+          keyOrder.push(key);
+        }
 
-    // 按出现顺序返回聚合结果
-    return keyOrder.map(
-      (key) => [key, map.get(key)!] as [string, SearchResult[]],
-    );
+        arr.push(item);
+        map.set(key, arr);
+      });
+
+      // 按出现顺序返回聚合结果
+      return keyOrder.map(
+        (key) => [key, map.get(key)!] as [string, SearchResult[]],
+      );
+    } catch (err) {
+      // FIXME: 聚合计算异常时降级为空结果，避免整个渲染树崩溃
+      console.error('aggregatedResults 计算异常:', err);
+      return [];
+    }
   }, [searchResults]);
 
   // 当聚合结果变化时，如果某个聚合已存在，则调用其卡片 ref 的 set 方法增量更新
@@ -310,6 +517,9 @@ function SearchPageClient() {
     const sourcesSet = new Map<string, string>();
     const titlesSet = new Set<string>();
     const yearsSet = new Set<string>();
+    const hasUnknownResolution = searchResults.some(
+      (item) => getResolutionLevel(item) === 0,
+    );
 
     searchResults.forEach((item) => {
       if (item.source && item.source_name) {
@@ -345,16 +555,26 @@ function SearchPageClient() {
       ...(hasUnknown ? [{ label: '未知', value: 'unknown' }] : []),
     ];
 
+    const resolutionOptions: { label: string; value: string }[] = [
+      { label: '全部清晰度', value: 'all' },
+      { label: '4K+', value: '2160' },
+      { label: '1080p+', value: '1080' },
+      { label: '720p+', value: '720' },
+      ...(hasUnknownResolution ? [{ label: '未知', value: 'unknown' }] : []),
+    ];
+
     const categoriesAll: SearchFilterCategory[] = [
       { key: 'source', label: '来源', options: sourceOptions },
       { key: 'title', label: '标题', options: titleOptions },
       { key: 'year', label: '年份', options: yearOptions },
+      { key: 'resolution', label: '清晰度', options: resolutionOptions },
     ];
 
     const categoriesAgg: SearchFilterCategory[] = [
       { key: 'source', label: '来源', options: sourceOptions },
       { key: 'title', label: '标题', options: titleOptions },
       { key: 'year', label: '年份', options: yearOptions },
+      { key: 'resolution', label: '清晰度', options: resolutionOptions },
     ];
 
     return { categoriesAll, categoriesAgg };
@@ -362,86 +582,252 @@ function SearchPageClient() {
 
   // 非聚合：应用筛选与排序
   const filteredAllResults = useMemo(() => {
-    const { source, title, year, yearOrder } = filterAll;
-    const filtered = searchResults.filter((item) => {
-      if (source !== 'all' && item.source !== source) return false;
-      if (title !== 'all' && item.title !== title) return false;
-      if (year !== 'all' && item.year !== year) return false;
-      return true;
-    });
+    try {
+      const safeResults = Array.isArray(searchResults) ? searchResults : [];
+      const { source, title, year, resolution, yearOrder } = filterAll;
+      const filtered = safeResults.filter((item) => {
+        if (!item) return false;
+        if (source !== 'all' && item.source !== source) return false;
+        if (title !== 'all' && item.title !== title) return false;
+        if (year !== 'all' && item.year !== year) return false;
+        if (!matchesResolutionFilter(item, resolution)) return false;
+        return true;
+      });
 
-    // 如果是无排序状态，直接返回过滤后的原始顺序
-    if (yearOrder === 'none') {
-      return filtered;
+      // 如果是无排序状态，直接返回过滤后的原始顺序
+      if (yearOrder === 'none') {
+        return filtered;
+      }
+
+      // 简化排序：1. 年份排序，2. 年份相同时精确匹配在前，3. 标题排序
+      return filtered.sort((a, b) => {
+        // 首先按年份排序
+        const yearComp = compareYear(a.year, b.year, yearOrder);
+        if (yearComp !== 0) return yearComp;
+
+        // 年份相同时，精确匹配在前
+        const aExactMatch = (a.title || '') === searchQuery.trim();
+        const bExactMatch = (b.title || '') === searchQuery.trim();
+        if (aExactMatch && !bExactMatch) return -1;
+        if (!aExactMatch && bExactMatch) return 1;
+
+        // 最后按标题排序，正序时字母序，倒序时反字母序
+        return yearOrder === 'asc'
+          ? (a.title || '').localeCompare(b.title || '')
+          : (b.title || '').localeCompare(a.title || '');
+      });
+    } catch (err) {
+      console.error('filteredAllResults 计算异常:', err);
+      return [];
     }
-
-    // 简化排序：1. 年份排序，2. 年份相同时精确匹配在前，3. 标题排序
-    return filtered.sort((a, b) => {
-      // 首先按年份排序
-      const yearComp = compareYear(a.year, b.year, yearOrder);
-      if (yearComp !== 0) return yearComp;
-
-      // 年份相同时，精确匹配在前
-      const aExactMatch = a.title === searchQuery.trim();
-      const bExactMatch = b.title === searchQuery.trim();
-      if (aExactMatch && !bExactMatch) return -1;
-      if (!aExactMatch && bExactMatch) return 1;
-
-      // 最后按标题排序，正序时字母序，倒序时反字母序
-      return yearOrder === 'asc'
-        ? a.title.localeCompare(b.title)
-        : b.title.localeCompare(a.title);
-    });
   }, [searchResults, filterAll, searchQuery]);
 
   // 聚合：应用筛选与排序
   const filteredAggResults = useMemo(() => {
-    const { source, title, year, yearOrder } = filterAgg as any;
-    const filtered = aggregatedResults.filter(([_, group]) => {
-      const gTitle = group[0]?.title ?? '';
-      const gYear = group[0]?.year ?? 'unknown';
-      const hasSource =
-        source === 'all' ? true : group.some((item) => item.source === source);
-      if (!hasSource) return false;
-      if (title !== 'all' && gTitle !== title) return false;
-      if (year !== 'all' && gYear !== year) return false;
-      return true;
-    });
+    try {
+      const safeAggResults = Array.isArray(aggregatedResults)
+        ? aggregatedResults
+        : [];
+      const { source, title, year, resolution, yearOrder } = filterAgg as any;
+      const filtered = safeAggResults.filter(([_, group]) => {
+        if (!Array.isArray(group) || group.length === 0) return false;
+        const gTitle = group[0]?.title ?? '';
+        const gYear = group[0]?.year ?? 'unknown';
+        const hasSource =
+          source === 'all'
+            ? true
+            : group.some((item) => item?.source === source);
+        if (!hasSource) return false;
+        if (title !== 'all' && gTitle !== title) return false;
+        if (year !== 'all' && gYear !== year) return false;
+        if (
+          resolution !== 'all' &&
+          !group.some((item) => matchesResolutionFilter(item, resolution))
+        ) {
+          return false;
+        }
+        return true;
+      });
 
-    // 如果是无排序状态，保持按关键字+年份+类型出现的原始顺序
-    if (yearOrder === 'none') {
-      return filtered;
+      // 如果是无排序状态，保持按关键字+年份+类型出现的原始顺序
+      if (yearOrder === 'none') {
+        return filtered;
+      }
+
+      // 简化排序：1. 年份排序，2. 年份相同时精确匹配在前，3. 标题排序
+      return filtered.sort((a, b) => {
+        // 首先按年份排序
+        const aYear = a[1][0]?.year ?? 'unknown';
+        const bYear = b[1][0]?.year ?? 'unknown';
+        const yearComp = compareYear(aYear, bYear, yearOrder);
+        if (yearComp !== 0) return yearComp;
+
+        // 年份相同时，精确匹配在前
+        const aExactMatch = (a[1][0]?.title ?? '') === searchQuery.trim();
+        const bExactMatch = (b[1][0]?.title ?? '') === searchQuery.trim();
+        if (aExactMatch && !bExactMatch) return -1;
+        if (!aExactMatch && bExactMatch) return 1;
+
+        // 最后按标题排序，正序时字母序，倒序时反字母序
+        const aTitle = a[1][0]?.title ?? '';
+        const bTitle = b[1][0]?.title ?? '';
+        return yearOrder === 'asc'
+          ? aTitle.localeCompare(bTitle)
+          : bTitle.localeCompare(aTitle);
+      });
+    } catch (err) {
+      console.error('filteredAggResults 计算异常:', err);
+      return [];
+    }
+  }, [aggregatedResults, filterAgg, searchQuery]);
+
+  const displayedResultCount = useMemo(() => {
+    if (viewMode === 'agg') {
+      return Array.isArray(filteredAggResults) ? filteredAggResults.length : 0;
     }
 
-    // 简化排序：1. 年份排序，2. 年份相同时精确匹配在前，3. 标题排序
-    return filtered.sort((a, b) => {
-      // 首先按年份排序
-      const aYear = a[1][0].year;
-      const bYear = b[1][0].year;
-      const yearComp = compareYear(aYear, bYear, yearOrder);
-      if (yearComp !== 0) return yearComp;
+    return Array.isArray(filteredAllResults) ? filteredAllResults.length : 0;
+  }, [filteredAggResults, filteredAllResults, viewMode]);
 
-      // 年份相同时，精确匹配在前
-      const aExactMatch = a[1][0].title === searchQuery.trim();
-      const bExactMatch = b[1][0].title === searchQuery.trim();
-      if (aExactMatch && !bExactMatch) return -1;
-      if (!aExactMatch && bExactMatch) return 1;
+  const totalResultPages = useMemo(
+    () =>
+      Math.max(1, Math.ceil(displayedResultCount / SEARCH_RESULT_PAGE_SIZE)),
+    [displayedResultCount],
+  );
 
-      // 最后按标题排序，正序时字母序，倒序时反字母序
-      const aTitle = a[1][0].title;
-      const bTitle = b[1][0].title;
-      return yearOrder === 'asc'
-        ? aTitle.localeCompare(bTitle)
-        : bTitle.localeCompare(aTitle);
+  const safeCurrentResultPage = Math.min(
+    Math.max(currentResultPage, 1),
+    totalResultPages,
+  );
+
+  const visibleAllResults = useMemo(() => {
+    const safeResults = Array.isArray(filteredAllResults)
+      ? filteredAllResults
+      : [];
+
+    if (resultLoadMode === 'pagination') {
+      const start = (safeCurrentResultPage - 1) * SEARCH_RESULT_PAGE_SIZE;
+      return safeResults.slice(start, start + SEARCH_RESULT_PAGE_SIZE);
+    }
+
+    return safeResults.slice(0, visibleResultCount);
+  }, [
+    filteredAllResults,
+    resultLoadMode,
+    safeCurrentResultPage,
+    visibleResultCount,
+  ]);
+
+  const visibleAggResults = useMemo(() => {
+    const safeResults = Array.isArray(filteredAggResults)
+      ? filteredAggResults
+      : [];
+
+    if (resultLoadMode === 'pagination') {
+      const start = (safeCurrentResultPage - 1) * SEARCH_RESULT_PAGE_SIZE;
+      return safeResults.slice(start, start + SEARCH_RESULT_PAGE_SIZE);
+    }
+
+    return safeResults.slice(0, visibleResultCount);
+  }, [
+    filteredAggResults,
+    resultLoadMode,
+    safeCurrentResultPage,
+    visibleResultCount,
+  ]);
+
+  const visibleDisplayedResultCount = useMemo(() => {
+    return viewMode === 'agg'
+      ? visibleAggResults.length
+      : visibleAllResults.length;
+  }, [viewMode, visibleAggResults.length, visibleAllResults.length]);
+
+  const hasMoreDisplayResults =
+    resultLoadMode === 'infinite' &&
+    visibleDisplayedResultCount < displayedResultCount;
+
+  useEffect(() => {
+    setCurrentResultPage((previous) =>
+      Math.min(Math.max(previous, 1), totalResultPages),
+    );
+  }, [totalResultPages]);
+
+  useEffect(() => {
+    setVisibleResultCount(SEARCH_RESULT_PAGE_SIZE);
+    setCurrentResultPage(1);
+  }, [
+    viewMode,
+    filterAll.source,
+    filterAll.title,
+    filterAll.year,
+    filterAll.yearOrder,
+    filterAgg.source,
+    filterAgg.title,
+    filterAgg.year,
+    filterAgg.yearOrder,
+    resultLoadMode,
+  ]);
+
+  const loadMoreSearchResults = useCallback(() => {
+    if (resultLoadMode !== 'infinite') return;
+
+    setVisibleResultCount((previous) => {
+      if (previous >= displayedResultCount) {
+        return previous;
+      }
+
+      return Math.min(previous + SEARCH_RESULT_PAGE_SIZE, displayedResultCount);
     });
-  }, [aggregatedResults, filterAgg, searchQuery]);
+  }, [displayedResultCount, resultLoadMode]);
+
+  useEffect(() => {
+    if (resultLoadMode !== 'infinite' || !hasMoreDisplayResults) return;
+    const node = loadMoreRef.current;
+    if (!node) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          loadMoreSearchResults();
+        }
+      },
+      { root: null, rootMargin: '520px 0px', threshold: 0 },
+    );
+
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMoreDisplayResults, loadMoreSearchResults, resultLoadMode]);
+
+  const scrollResultsIntoView = useCallback(() => {
+    resultsSectionRef.current?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+    });
+  }, []);
+
+  const goToResultPage = useCallback(
+    (page: number) => {
+      setCurrentResultPage(
+        Math.min(Math.max(Math.round(page), 1), totalResultPages),
+      );
+      scrollResultsIntoView();
+    },
+    [scrollResultsIntoView, totalResultPages],
+  );
 
   useEffect(() => {
     // 无搜索参数时聚焦搜索框
     !searchParams.get('q') && document.getElementById('searchInput')?.focus();
 
     // 初始加载搜索历史
-    getSearchHistory().then(setSearchHistory);
+    void getSearchHistory()
+      .then((history) => {
+        setSearchHistory(Array.isArray(history) ? history : []);
+      })
+      .catch((error) => {
+        console.error('getSearchHistory failed:', error);
+        setSearchHistory([]);
+      });
 
     // 读取流式搜索设置
     if (typeof window !== 'undefined') {
@@ -453,163 +839,253 @@ function SearchPageClient() {
       } else if (defaultFluidSearch !== undefined) {
         setUseFluidSearch(defaultFluidSearch);
       }
+
+      setResultLoadMode(
+        (window as any).RUNTIME_CONFIG?.SEARCH_RESULT_LOAD_MODE === 'pagination'
+          ? 'pagination'
+          : 'infinite',
+      );
     }
 
     // 监听搜索历史更新事件
     const unsubscribe = subscribeToDataUpdates(
       'searchHistoryUpdated',
       (newHistory: string[]) => {
-        setSearchHistory(newHistory);
+        setSearchHistory(Array.isArray(newHistory) ? newHistory : []);
       },
     );
 
     // 获取滚动位置的函数 - 专门针对 body 滚动
-    const getScrollTop = () => {
-      return document.body.scrollTop || 0;
+    const getScrollTop = () =>
+      document.body.scrollTop || document.documentElement.scrollTop || 0;
+
+    const updateBackToTopState = () => {
+      setShowBackToTop(getScrollTop() > 300);
     };
 
-    // 使用 requestAnimationFrame 持续检测滚动位置
-    let isRunning = false;
-    const checkScrollPosition = () => {
-      if (!isRunning) return;
-
-      const scrollTop = getScrollTop();
-      const shouldShow = scrollTop > 300;
-      setShowBackToTop(shouldShow);
-
-      requestAnimationFrame(checkScrollPosition);
-    };
-
-    // 启动持续检测
-    isRunning = true;
-    checkScrollPosition();
-
-    // 监听 body 元素的滚动事件
     const handleScroll = () => {
-      const scrollTop = getScrollTop();
-      setShowBackToTop(scrollTop > 300);
+      if (backToTopRafRef.current !== null) return;
+      backToTopRafRef.current = window.requestAnimationFrame(() => {
+        backToTopRafRef.current = null;
+        updateBackToTopState();
+      });
     };
 
+    updateBackToTopState();
+    window.addEventListener('scroll', handleScroll, { passive: true });
     document.body.addEventListener('scroll', handleScroll, { passive: true });
 
     return () => {
       unsubscribe();
-      isRunning = false; // 停止 requestAnimationFrame 循环
-
-      // 移除 body 滚动事件监听器
+      window.removeEventListener('scroll', handleScroll);
       document.body.removeEventListener('scroll', handleScroll);
+      if (backToTopRafRef.current !== null) {
+        cancelAnimationFrame(backToTopRafRef.current);
+        backToTopRafRef.current = null;
+      }
     };
   }, []);
 
   useEffect(() => {
-    // 当搜索参数变化时更新搜索状态
     const query = searchParams.get('q') || '';
-    currentQueryRef.current = query.trim();
+    const trimmed = query.trim();
+    currentQueryRef.current = trimmed;
+    groupRefs.current.clear();
+    groupStatsRef.current.clear();
+    setVisibleResultCount(SEARCH_RESULT_PAGE_SIZE);
+    setCurrentResultPage(1);
 
-    if (query) {
-      setSearchQuery(query);
-      setNormalizedQuery(''); // 重置
-      // 新搜索：关闭旧连接并清空结果
+    if (typeof window !== 'undefined') {
+      setResultLoadMode(
+        (window as any).RUNTIME_CONFIG?.SEARCH_RESULT_LOAD_MODE === 'pagination'
+          ? 'pagination'
+          : 'infinite',
+      );
+    }
+
+    const clearSearchConnection = () => {
       if (eventSourceRef.current) {
         try {
           eventSourceRef.current.close();
         } catch {}
         eventSourceRef.current = null;
       }
-      setSearchResults([]);
-      setTotalSources(0);
-      setCompletedSources(0);
-      // 清理缓冲
+
       pendingResultsRef.current = [];
       if (flushTimerRef.current) {
         clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
       }
-      setIsLoading(true);
-      setShowResults(true);
+    };
 
-      const trimmed = query.trim();
+    if (!trimmed) {
+      clearSearchConnection();
+      setShowResults(false);
+      setShowSuggestions(false);
+      setHasSearchError(false);
+      return;
+    }
 
-      // 每次搜索时重新读取设置，确保使用最新的配置
-      let currentFluidSearch = useFluidSearch;
-      if (typeof window !== 'undefined') {
+    setSearchQuery(query);
+    clearSearchConnection();
+    applySafeSearchState(
+      createSafeSearchState({
+        data: [],
+        isLoading: true,
+        hasError: false,
+      }),
+    );
+    setShowResults(true);
+
+    let currentFluidSearch = useFluidSearch;
+    if (typeof window !== 'undefined') {
+      try {
         const savedFluidSearch = localStorage.getItem('fluidSearch');
         if (savedFluidSearch !== null) {
-          currentFluidSearch = JSON.parse(savedFluidSearch);
+          currentFluidSearch = Boolean(JSON.parse(savedFluidSearch));
         } else {
           const defaultFluidSearch =
             (window as any).RUNTIME_CONFIG?.FLUID_SEARCH !== false;
-          currentFluidSearch = defaultFluidSearch;
+          currentFluidSearch = Boolean(defaultFluidSearch);
         }
+      } catch (error) {
+        console.error('fluidSearch parse failed:', error);
       }
+    }
 
-      // 如果读取的配置与当前状态不同，更新状态
-      if (currentFluidSearch !== useFluidSearch) {
-        setUseFluidSearch(currentFluidSearch);
+    if (currentFluidSearch !== useFluidSearch) {
+      setUseFluidSearch(currentFluidSearch);
+    }
+
+    const fetchCanonicalSearchResults = async (
+      completedSourceCount: number,
+    ): Promise<boolean> => {
+      try {
+        const response = await fetch(
+          '/api/search?q=' + encodeURIComponent(trimmed),
+        );
+        if (!response.ok) {
+          throw new Error(
+            'search request failed with status ' + response.status,
+          );
+        }
+
+        const payload = (await response.json()) as Record<string, unknown>;
+        if (currentQueryRef.current !== trimmed) {
+          return false;
+        }
+
+        applySafeSearchState(
+          createSafeSearchState({
+            data: sanitizeSearchResults(payload.results),
+            normalizedQuery:
+              typeof payload.normalizedQuery === 'string'
+                ? payload.normalizedQuery
+                : '',
+            isLoading: false,
+            hasError: false,
+            totalSources:
+              totalSources > 0
+                ? totalSources
+                : Math.max(completedSourceCount, 1),
+            completedSources:
+              totalSources > 0
+                ? totalSources
+                : Math.max(completedSourceCount, 1),
+          }),
+        );
+        return true;
+      } catch (error) {
+        console.error('canonical search request failed:', error);
+        return false;
       }
+    };
 
-      if (currentFluidSearch) {
-        // 流式搜索：打开新的流式连接
+    const markSearchFailed = () => {
+      flushPendingResults();
+      applySafeSearchState(
+        createSafeSearchState({
+          data: searchResultsRef.current,
+          normalizedQuery,
+          isLoading: false,
+          hasError: true,
+          totalSources: totalSources || 1,
+          completedSources,
+        }),
+      );
+    };
+
+    if (currentFluidSearch) {
+      try {
         const es = new EventSource(
-          `/api/search/ws?q=${encodeURIComponent(trimmed)}`,
+          '/api/search/ws?q=' + encodeURIComponent(trimmed),
         );
         eventSourceRef.current = es;
 
         es.onmessage = (event) => {
-          if (!event.data) return;
+          if (!event.data || currentQueryRef.current !== trimmed) {
+            return;
+          }
+
           try {
-            const payload = JSON.parse(event.data);
-            if (currentQueryRef.current !== trimmed) return;
-            switch (payload.type) {
-              case 'start':
-                setTotalSources(payload.totalSources || 0);
-                if (payload.normalizedQuery) {
+            const payload = JSON.parse(event.data) as Record<string, unknown>;
+            const payloadType =
+              typeof payload.type === 'string' ? payload.type : '';
+
+            switch (payloadType) {
+              case 'start': {
+                setTotalSources(
+                  typeof payload.totalSources === 'number' &&
+                    Number.isFinite(payload.totalSources)
+                    ? payload.totalSources
+                    : 0,
+                );
+                if (typeof payload.normalizedQuery === 'string') {
                   setNormalizedQuery(payload.normalizedQuery);
                 }
                 setCompletedSources(0);
+                setHasSearchError(false);
                 break;
+              }
               case 'source_result': {
-                setCompletedSources((prev) => prev + 1);
-                if (
-                  Array.isArray(payload.results) &&
-                  payload.results.length > 0
-                ) {
-                  // 缓冲新增结果，节流刷入，避免频繁重渲染导致闪烁
-                  // ✨ 后端已按相关性排序，直接使用结果
-                  const incoming: SearchResult[] =
-                    payload.results as SearchResult[];
-                  pendingResultsRef.current.push(...incoming);
-                  if (!flushTimerRef.current) {
-                    flushTimerRef.current = window.setTimeout(() => {
-                      const toAppend = pendingResultsRef.current;
-                      pendingResultsRef.current = [];
-                      startTransition(() => {
-                        setSearchResults((prev) => prev.concat(toAppend));
-                      });
-                      flushTimerRef.current = null;
-                    }, 80);
-                  }
+                setCompletedSources((previous) => previous + 1);
+                const incoming = sanitizeSearchResults(payload.results);
+                if (incoming.length === 0) {
+                  break;
+                }
+
+                pendingResultsRef.current.push(...incoming);
+                if (!flushTimerRef.current) {
+                  flushTimerRef.current = window.setTimeout(
+                    flushPendingResults,
+                    80,
+                  );
                 }
                 break;
               }
               case 'source_error':
-                setCompletedSources((prev) => prev + 1);
+                setCompletedSources((previous) => previous + 1);
                 break;
               case 'complete':
-                setCompletedSources(payload.completedSources || totalSources);
-                // 完成前确保将缓冲写入
-                if (pendingResultsRef.current.length > 0) {
-                  const toAppend = pendingResultsRef.current;
-                  pendingResultsRef.current = [];
-                  if (flushTimerRef.current) {
-                    clearTimeout(flushTimerRef.current);
-                    flushTimerRef.current = null;
-                  }
-                  startTransition(() => {
-                    setSearchResults((prev) => prev.concat(toAppend));
-                  });
+                {
+                  const completedSourceCount =
+                    typeof payload.completedSources === 'number' &&
+                    Number.isFinite(payload.completedSources)
+                      ? payload.completedSources
+                      : totalSources;
+
+                  setCompletedSources(completedSourceCount);
+                  flushPendingResults();
+
+                  void (async () => {
+                    const synced =
+                      await fetchCanonicalSearchResults(completedSourceCount);
+                    if (!synced && currentQueryRef.current === trimmed) {
+                      setIsLoading(false);
+                      setHasSearchError(false);
+                    }
+                  })();
                 }
-                setIsLoading(false);
                 try {
                   es.close();
                 } catch {}
@@ -618,23 +1094,13 @@ function SearchPageClient() {
                 }
                 break;
             }
-          } catch {}
+          } catch (error) {
+            console.error('search stream payload parse failed:', error);
+          }
         };
 
         es.onerror = () => {
-          setIsLoading(false);
-          // 错误时也清空缓冲
-          if (pendingResultsRef.current.length > 0) {
-            const toAppend = pendingResultsRef.current;
-            pendingResultsRef.current = [];
-            if (flushTimerRef.current) {
-              clearTimeout(flushTimerRef.current);
-              flushTimerRef.current = null;
-            }
-            startTransition(() => {
-              setSearchResults((prev) => prev.concat(toAppend));
-            });
-          }
+          markSearchFailed();
           try {
             es.close();
           } catch {}
@@ -642,40 +1108,65 @@ function SearchPageClient() {
             eventSourceRef.current = null;
           }
         };
-      } else {
-        // 传统搜索：使用普通接口
-        fetch(`/api/search?q=${encodeURIComponent(trimmed)}`)
-          .then((response) => response.json())
-          .then((data) => {
-            if (currentQueryRef.current !== trimmed) return;
-
-            if (data.normalizedQuery) {
-              setNormalizedQuery(data.normalizedQuery);
-            }
-
-            if (data.results && Array.isArray(data.results)) {
-              // ✨ 后端已按相关性排序，直接使用结果
-              const results: SearchResult[] = data.results as SearchResult[];
-
-              setSearchResults(results);
-              setTotalSources(1);
-              setCompletedSources(1);
-            }
-            setIsLoading(false);
-          })
-          .catch(() => {
-            setIsLoading(false);
-          });
+      } catch (error) {
+        console.error('search stream request failed:', error);
+        markSearchFailed();
       }
-      setShowSuggestions(false);
-
-      // 保存到搜索历史 (事件监听会自动更新界面)
-      addSearchHistory(query);
     } else {
-      setShowResults(false);
-      setShowSuggestions(false);
+      const fetchSearchResults = async () => {
+        try {
+          const response = await fetch(
+            '/api/search?q=' + encodeURIComponent(trimmed),
+          );
+          if (!response.ok) {
+            throw new Error(
+              'search request failed with status ' + response.status,
+            );
+          }
+
+          const payload = (await response.json()) as Record<string, unknown>;
+          if (currentQueryRef.current !== trimmed) {
+            return;
+          }
+
+          applySafeSearchState(
+            createSafeSearchState({
+              data: sanitizeSearchResults(payload.results),
+              normalizedQuery:
+                typeof payload.normalizedQuery === 'string'
+                  ? payload.normalizedQuery
+                  : '',
+              isLoading: false,
+              hasError: false,
+              totalSources: 1,
+              completedSources: 1,
+            }),
+          );
+        } catch (error) {
+          console.error('search request failed:', error);
+          if (currentQueryRef.current !== trimmed) {
+            return;
+          }
+          applySafeSearchState(
+            createSafeSearchState({
+              data: [],
+              isLoading: false,
+              hasError: true,
+              totalSources: 1,
+              completedSources: 1,
+            }),
+          );
+        }
+      };
+
+      void fetchSearchResults();
     }
-  }, [searchParams]);
+
+    setShowSuggestions(false);
+    void addSearchHistory(trimmed).catch((error) => {
+      console.error('addSearchHistory failed:', error);
+    });
+  }, [applySafeSearchState, flushPendingResults, searchParams, useFluidSearch]);
 
   // 组件卸载时，关闭可能存在的连接
   useEffect(() => {
@@ -691,6 +1182,9 @@ function SearchPageClient() {
         flushTimerRef.current = null;
       }
       pendingResultsRef.current = [];
+      searchResultsRef.current = [];
+      groupRefs.current.clear();
+      groupStatsRef.current.clear();
     };
   }, []);
 
@@ -722,6 +1216,7 @@ function SearchPageClient() {
     // 回显搜索框
     setSearchQuery(trimmed);
     setIsLoading(true);
+    setHasSearchError(false);
     setShowResults(true);
     setShowSuggestions(false);
 
@@ -735,6 +1230,7 @@ function SearchPageClient() {
 
     // 自动执行搜索
     setIsLoading(true);
+    setHasSearchError(false);
     setShowResults(true);
 
     router.push(`/search?q=${encodeURIComponent(suggestion)}`);
@@ -804,6 +1300,7 @@ function SearchPageClient() {
                   // 回显搜索框
                   setSearchQuery(trimmed);
                   setIsLoading(true);
+                  setHasSearchError(false);
                   setShowResults(true);
                   setShowSuggestions(false);
 
@@ -817,11 +1314,19 @@ function SearchPageClient() {
         {/* 搜索结果或搜索历史 */}
         <div className='max-w-[95%] mx-auto mt-12 overflow-visible'>
           {showResults ? (
-            <section className='mb-12'>
+            <section ref={resultsSectionRef} className='mb-12'>
               {/* 标题 */}
               <div className='mb-4'>
                 <h2 className='text-xl font-bold text-gray-800 dark:text-gray-200'>
                   搜索结果
+                  <span className='ml-2 text-sm font-normal text-gray-500 dark:text-gray-400'>
+                    {viewMode === 'agg'
+                      ? `当前展示 ${visibleDisplayedResultCount}/${displayedResultCount} 组 / 原始 ${searchResults.length} 条`
+                      : `当前展示 ${visibleDisplayedResultCount}/${displayedResultCount} 条 / 原始 ${searchResults.length} 条`}
+                  </span>
+                  <span className='ml-2 text-xs font-normal text-gray-400 dark:text-gray-500'>
+                    {resultLoadMode === 'pagination' ? '分页显示' : '触底加载'}
+                  </span>
                   {totalSources > 0 && useFluidSearch && (
                     <span className='ml-2 text-sm font-normal text-gray-500 dark:text-gray-400'>
                       {completedSources}/{totalSources}
@@ -875,66 +1380,124 @@ function SearchPageClient() {
                   <div className='flex justify-center items-center h-40'>
                     <div className='animate-spin rounded-full h-8 w-8 border-b-2 border-green-500'></div>
                   </div>
+                ) : hasSearchError ? (
+                  <div className='text-center text-rose-500 py-8 dark:text-rose-300'>
+                    加载失败，请重试
+                  </div>
                 ) : (
                   <div className='text-center text-gray-500 py-8 dark:text-gray-400'>
                     未找到相关结果
                   </div>
                 )
               ) : (
-                <div
-                  key={`search-results-${viewMode}`}
-                  className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] sm:gap-x-8'
+                <ErrorBoundary
+                  resetKeys={[
+                    searchQuery,
+                    viewMode,
+                    searchResults.length,
+                    hasSearchError,
+                  ]}
+                  onError={(error) => {
+                    console.error('Search results grid crashed:', error);
+                  }}
+                  fallback={
+                    <div className='rounded-xl border border-rose-200/70 bg-rose-50 px-4 py-8 text-center text-sm text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-300'>
+                      加载失败，请重试
+                    </div>
+                  }
                 >
-                  {viewMode === 'agg'
-                    ? filteredAggResults.map(([mapKey, group]) => {
-                        const title = group[0]?.title || '';
-                        const poster = group[0]?.poster || '';
-                        const year = group[0]?.year || 'unknown';
-                        const { episodes, source_names, douban_id } =
-                          computeGroupStats(group);
-                        const type = episodes === 1 ? 'movie' : 'tv';
+                  {viewMode === 'agg' ? (
+                    Array.isArray(filteredAggResults) ? (
+                      <>
+                        <VirtualizedVideoGrid
+                          // The search page currently scrolls with document.body,
+                          // which can break window-scroll virtualization and make
+                          // only the first screenful of cards appear reachable.
+                          // Prefer full rendering here until the scroll container
+                          // is wired to Virtuoso correctly.
+                          mode='never'
+                          data={visibleAggResults}
+                          virtualizationThreshold={240}
+                          overscan={640}
+                          className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] sm:gap-x-8'
+                          itemKey={([mapKey]) => `agg-${mapKey}`}
+                          renderItem={([mapKey, group]) => {
+                            const safeGroup =
+                              Array.isArray(group) && group.length > 0
+                                ? group
+                                : [];
+                            if (safeGroup.length === 0) return null;
+                            const title = safeGroup[0]?.title || '';
+                            const poster = safeGroup[0]?.poster || '';
+                            const year = safeGroup[0]?.year || 'unknown';
+                            const { episodes, source_names, douban_id } =
+                              computeGroupStats(safeGroup);
+                            const type = episodes === 1 ? 'movie' : 'tv';
 
-                        // 如果该聚合第一次出现，写入初始统计
-                        if (!groupStatsRef.current.has(mapKey)) {
-                          groupStatsRef.current.set(mapKey, {
-                            episodes,
-                            source_names,
-                            douban_id,
-                          });
-                        }
+                            if (!groupStatsRef.current.has(mapKey)) {
+                              groupStatsRef.current.set(mapKey, {
+                                episodes,
+                                source_names,
+                                douban_id,
+                              });
+                            }
 
-                        return (
-                          <div key={`agg-${mapKey}`} className='w-full'>
-                            <VideoCard
-                              ref={getGroupRef(mapKey)}
-                              from='search'
-                              isAggregate={true}
-                              title={title}
-                              poster={poster}
-                              year={year}
-                              episodes={episodes}
-                              source_names={source_names}
-                              douban_id={douban_id}
-                              query={
-                                searchQuery.trim() !== title
-                                  ? searchQuery.trim()
-                                  : ''
-                              }
-                              type={type}
-                            />
-                          </div>
-                        );
-                      })
-                    : filteredAllResults.map((item) => (
-                        <div
-                          key={`all-${item.source}-${item.id}`}
-                          className='w-full'
-                        >
+                            return (
+                              <VideoCard
+                                ref={getGroupRef(mapKey)}
+                                from='search'
+                                isAggregate={true}
+                                title={title}
+                                poster={poster}
+                                year={year}
+                                episodes={episodes}
+                                source_names={source_names}
+                                douban_id={douban_id}
+                                query={
+                                  searchQuery.trim() !== title
+                                    ? searchQuery.trim()
+                                    : ''
+                                }
+                                type={type}
+                              />
+                            );
+                          }}
+                        />
+                        {resultLoadMode === 'pagination' ? (
+                          <SearchResultPagination
+                            currentPage={safeCurrentResultPage}
+                            totalPages={totalResultPages}
+                            onPageChange={goToResultPage}
+                          />
+                        ) : (
+                          <SearchResultLoadMoreSentinel
+                            ref={loadMoreRef}
+                            hasMore={hasMoreDisplayResults}
+                          />
+                        )}
+                      </>
+                    ) : (
+                      <div className='text-center text-rose-500 py-8 dark:text-rose-300'>
+                        加载失败，请重试
+                      </div>
+                    )
+                  ) : Array.isArray(filteredAllResults) ? (
+                    <>
+                      <VirtualizedVideoGrid
+                        // See the aggregate grid note above. Disable virtualization
+                        // on the search page so all matched results remain reachable.
+                        mode='never'
+                        data={visibleAllResults}
+                        virtualizationThreshold={240}
+                        overscan={640}
+                        className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] sm:gap-x-8'
+                        itemKey={(item) => `all-${item.source}-${item.id}`}
+                        renderItem={(item) => (
                           <VideoCard
                             id={item.id}
                             title={item.title}
                             poster={item.poster}
-                            episodes={item.episodes.length}
+                            episodes={item.episodes?.length ?? 0}
                             source={item.source}
                             source_name={item.source_name}
                             douban_id={item.douban_id}
@@ -945,11 +1508,31 @@ function SearchPageClient() {
                             }
                             year={item.year}
                             from='search'
-                            type={item.episodes.length > 1 ? 'tv' : 'movie'}
+                            type={
+                              (item.episodes?.length ?? 0) > 1 ? 'tv' : 'movie'
+                            }
                           />
-                        </div>
-                      ))}
-                </div>
+                        )}
+                      />
+                      {resultLoadMode === 'pagination' ? (
+                        <SearchResultPagination
+                          currentPage={safeCurrentResultPage}
+                          totalPages={totalResultPages}
+                          onPageChange={goToResultPage}
+                        />
+                      ) : (
+                        <SearchResultLoadMoreSentinel
+                          ref={loadMoreRef}
+                          hasMore={hasMoreDisplayResults}
+                        />
+                      )}
+                    </>
+                  ) : (
+                    <div className='text-center text-rose-500 py-8 dark:text-rose-300'>
+                      加载失败，请重试
+                    </div>
+                  )}
+                </ErrorBoundary>
               )}
             </section>
           ) : searchHistory.length > 0 ? (
@@ -1005,7 +1588,7 @@ function SearchPageClient() {
       {/* 返回顶部悬浮按钮 */}
       <button
         onClick={scrollToTop}
-        className={`fixed bottom-20 md:bottom-6 right-6 z-500 w-12 h-12 bg-green-500/90 hover:bg-green-500 text-white rounded-full shadow-lg backdrop-blur-sm transition-all duration-300 ease-in-out flex items-center justify-center group ${
+        className={`fixed bottom-20 md:bottom-6 right-6 z-500 w-12 h-12 bg-green-500/95 hover:bg-green-500 text-white rounded-full shadow-lg transition-all duration-300 ease-in-out flex items-center justify-center group ${
           showBackToTop
             ? 'opacity-100 translate-y-0 pointer-events-auto'
             : 'opacity-0 translate-y-4 pointer-events-none'

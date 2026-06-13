@@ -2,9 +2,9 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie, getAuthSecret } from '@/lib/auth';
+import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
+import { getAuthSecret, verifyApiAuth } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
-import { db } from '@/lib/db';
 
 export const runtime = 'nodejs';
 
@@ -18,23 +18,22 @@ type Action =
   | 'batch_disable'
   | 'batch_enable'
   | 'batch_delete'
-  | 'update_adult';
+  | 'update_adult'
+  | 'update_ad_filter';
 
 interface BaseBody {
   action?: Action;
 }
 
 export async function POST(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-  const hasRedis = !!(process.env.REDIS_URL || process.env.KV_REST_API_URL);
-  const isLocalMode = storageType === 'localstorage' && !hasRedis;
-
-  // 预检 auth secret，缺失时在开发/Docker 环境下给出警告（不影响本地免密模式）
+  // 预检 auth secret，缺失时在开发/Docker 环境下给出警告
   getAuthSecret();
 
-  // 🔐 本地模式（无数据库）：跳过认证，返回成功
-  // 安全性说明：仅当没有配置任何数据库时才启用此模式
-  if (isLocalMode) {
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
+
+  // 本地模式（无数据库）：跳过认证，返回成功
+  if (authResult.isLocalMode) {
     return NextResponse.json(
       {
         ok: true,
@@ -45,15 +44,20 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // 认证失败
+  if (!authResult.isValid) {
+    console.log('[admin/source] 认证失败:', {
+      hasAuth: !!request.cookies.get('auth'),
+      isLocalMode: authResult.isLocalMode,
+    });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
     const body = (await request.json()) as BaseBody & Record<string, any>;
     const { action } = body;
 
-    const authInfo = getAuthInfoFromCookie(request);
-    if (!authInfo || !authInfo.username) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-    const username = authInfo.username;
+    const username = authResult.username;
 
     // 基础校验
     const ACTIONS: Action[] = [
@@ -66,16 +70,17 @@ export async function POST(request: NextRequest) {
       'batch_enable',
       'batch_delete',
       'update_adult',
+      'update_ad_filter',
     ];
-    if (!username || !action || !ACTIONS.includes(action)) {
+    if (!action || !ACTIONS.includes(action)) {
       return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
     }
 
     // 获取配置与存储
     const adminConfig = await getConfig();
 
-    // 权限与身份校验
-    if (username !== process.env.USERNAME) {
+    // 权限与身份校验（仅数据库模式需要检查用户权限）
+    if (username && username !== process.env.USERNAME) {
       const userEntry = adminConfig.UserConfig.Users.find(
         (u) => u.username === username,
       );
@@ -138,6 +143,19 @@ export async function POST(request: NextRequest) {
         if (!entry)
           return NextResponse.json({ error: '源不存在' }, { status: 404 });
         entry.is_adult = is_adult || false;
+        break;
+      }
+      case 'update_ad_filter': {
+        const { key, disable_ad_filter } = body as {
+          key?: string;
+          disable_ad_filter?: boolean;
+        };
+        if (!key)
+          return NextResponse.json({ error: '缺少 key 参数' }, { status: 400 });
+        const entry = adminConfig.SourceConfig.find((s) => s.key === key);
+        if (!entry)
+          return NextResponse.json({ error: '源不存在' }, { status: 404 });
+        entry.disable_ad_filter = !!disable_ad_filter;
         break;
       }
       case 'delete': {
@@ -277,8 +295,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: '未知操作' }, { status: 400 });
     }
 
-    // 持久化到存储
-    await db.saveAdminConfig(adminConfig);
+    await persistAdminConfigMutation(adminConfig);
 
     return NextResponse.json(
       { ok: true },

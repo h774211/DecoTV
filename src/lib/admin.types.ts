@@ -1,3 +1,47 @@
+export interface DanmuCustomNode {
+  id: string;
+  name: string;
+  url: string;
+  token: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PanSouNode {
+  id: string;
+  name: string;
+  serverUrl: string;
+  token: string;
+  username: string;
+  password: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PrivateLibraryConnector {
+  id: string;
+  name: string;
+  displayName?: string;
+  type: 'openlist' | 'emby' | 'jellyfin' | 'xiaoya';
+  enabled: boolean;
+  serverUrl: string;
+  token: string;
+  alistToken?: string;
+  username?: string;
+  password?: string;
+  rootPath?: string;
+  userId?: string;
+  libraryFilter?: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PrivateLibraryConfig {
+  connectors: PrivateLibraryConnector[];
+}
+
+export type SearchResultLoadMode = 'infinite' | 'pagination';
+
 export interface AdminConfig {
   ConfigSubscribtion: {
     URL: string;
@@ -14,16 +58,23 @@ export interface AdminConfig {
     DoubanProxy: string;
     DoubanImageProxyType: string;
     DoubanImageProxy: string;
+    TmdbProxyType?: 'direct' | 'forward' | 'reverse';
+    TmdbProxy?: string;
+    TmdbReverseProxy?: string;
     DisableYellowFilter: boolean;
     FluidSearch: boolean;
+    SearchResultLoadMode: SearchResultLoadMode;
+    LoginBackground?: string;
   };
   UserConfig: {
+    RegistrationEnabled: boolean;
+    RegistrationDefaultUserGroup: string;
     Users: {
       username: string;
       role: 'user' | 'admin' | 'owner';
       banned?: boolean;
-      enabledApis?: string[]; // 优先级高于tags限制
-      tags?: string[]; // 多 tags 取并集限制
+      enabledApis?: string[];
+      tags?: string[];
     }[];
     Tags?: {
       name: string;
@@ -37,7 +88,8 @@ export interface AdminConfig {
     detail?: string;
     from: 'config' | 'custom';
     disabled?: boolean;
-    is_adult?: boolean; // 标记是否为成人资源
+    is_adult?: boolean;
+    disable_ad_filter?: boolean;
   }[];
   CustomCategories: {
     name?: string;
@@ -49,13 +101,43 @@ export interface AdminConfig {
   LiveConfig?: {
     key: string;
     name: string;
-    url: string; // m3u 地址
+    url: string;
     ua?: string;
-    epg?: string; // 节目单
+    epg?: string;
     from: 'config' | 'custom';
     channelNumber?: number;
     disabled?: boolean;
   }[];
+  DanmuConfig?: {
+    enabled: boolean;
+    serverUrl: string;
+    token: string;
+    platform: string;
+    sourceOrder: string;
+    mergeSourcePairs: string;
+    bilibiliCookie: string;
+    convertTopBottomToScroll: boolean;
+    convertColor: 'default' | 'white' | 'color';
+    danmuLimit: number;
+    blockedWords: string;
+    danmuOutputFormat: 'json' | 'xml';
+    simplifiedTraditional: 'default' | 'simplified' | 'traditional';
+    customNodes?: DanmuCustomNode[];
+  };
+  PanSouConfig?: {
+    activeNodeId: string;
+    nodes: PanSouNode[];
+  };
+  TMDBConfig?: {
+    ApiKey: string;
+    ProxyType: 'direct' | 'forward' | 'reverse';
+    Proxy: string;
+    ReverseProxy: string;
+  };
+  PrivateLibraryConfig?: PrivateLibraryConfig;
+  AdFilterConfig?: {
+    enabled: boolean;
+  };
 }
 
 export interface AdminConfigResult {

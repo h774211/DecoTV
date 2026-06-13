@@ -5,6 +5,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getConfig } from '@/lib/config';
 import { searchFromApi } from '@/lib/downstream';
 import { rankSearchResults } from '@/lib/search-ranking';
+import { getLastNonEmptySearchParam } from '@/lib/tvbox-utils';
+import {
+  buildResolutionFilterFromSearchParams,
+  filterSearchResultsByResolution,
+  formatResolutionLabel,
+} from '@/lib/video-quality';
 import { yellowWords } from '@/lib/yellow';
 
 export const runtime = 'nodejs';
@@ -18,7 +24,7 @@ const containsYellowKeyword = (
     if (!field) return false;
     const normalized = field.toLowerCase();
     return normalizedYellowWords.some((keyword) =>
-      normalized.includes(keyword)
+      normalized.includes(keyword),
     );
   });
 };
@@ -54,10 +60,18 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const sourceKey = searchParams.get('source');
-    const query = searchParams.get('wd');
+    const query = getLastNonEmptySearchParam(searchParams, [
+      'wd',
+      'q',
+      'key',
+      'keyword',
+      'searchword',
+    ]);
     const filterRaw = searchParams.get('filter');
     const filterParam = (filterRaw ?? 'on').toLowerCase();
     const strictMode = searchParams.get('strict') === '1';
+    const resolutionFilter =
+      buildResolutionFilterFromSearchParams(searchParams);
 
     // 参数验证
     if (!sourceKey || !query) {
@@ -67,18 +81,18 @@ export async function GET(request: NextRequest) {
           msg: '缺少必要参数: source 或 wd',
           list: [],
         },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
     const config = await getConfig();
     const adultSourceKeys = new Set(
-      config.SourceConfig.filter((s) => s.is_adult).map((s) => s.key)
+      config.SourceConfig.filter((s) => s.is_adult).map((s) => s.key),
     );
     const adultSourceNames = new Set(
       config.SourceConfig.filter((s) => s.is_adult && s.name).map((s) =>
-        s.name.trim().toLowerCase()
-      )
+        s.name.trim().toLowerCase(),
+      ),
     );
     const siteDefaultFilter = true; // 站点默认开启成人过滤
     const shouldFilter =
@@ -95,7 +109,7 @@ export async function GET(request: NextRequest) {
           msg: `未找到视频源: ${sourceKey}`,
           list: [],
         },
-        { status: 404 }
+        { status: 404 },
       );
     }
 
@@ -107,19 +121,19 @@ export async function GET(request: NextRequest) {
           msg: `视频源已被禁用: ${sourceKey}`,
           list: [],
         },
-        { status: 403 }
+        { status: 403 },
       );
     }
 
     console.log(
       `[TVBox Search Proxy] source=${sourceKey}, query="${query}", filter=${filterParam}, strict=${strictMode}, client=${
         isOrion ? 'orion' : 'generic'
-      }`
+      }`,
     );
 
     if (shouldFilter && targetSource.is_adult) {
       console.warn(
-        `[TVBox Search Proxy] source=${sourceKey} blocked by adult policy`
+        `[TVBox Search Proxy] source=${sourceKey} blocked by adult policy`,
       );
       return NextResponse.json(
         {
@@ -140,7 +154,7 @@ export async function GET(request: NextRequest) {
             'Cache-Control': 'public, max-age=60, s-maxage=60',
             'X-Filter-Applied': 'true',
           },
-        }
+        },
       );
     }
 
@@ -152,11 +166,11 @@ export async function GET(request: NextRequest) {
         api: targetSource.api,
         detail: targetSource.detail,
       },
-      query
+      query,
     );
 
     console.log(
-      `[TVBox Search Proxy] Fetched ${results.length} results from upstream`
+      `[TVBox Search Proxy] Fetched ${results.length} results from upstream`,
     );
 
     // 🔒 成人内容过滤（Orion 客户端下更严格）
@@ -190,7 +204,7 @@ export async function GET(request: NextRequest) {
       console.log(
         `[TVBox Search Proxy] Adult filter: ${beforeFilterCount} → ${
           results.length
-        } (filtered ${beforeFilterCount - results.length})`
+        } (filtered ${beforeFilterCount - results.length})`,
       );
     }
 
@@ -225,13 +239,25 @@ export async function GET(request: NextRequest) {
       });
 
       console.log(
-        `[TVBox Search Proxy] Strict mode: ${beforeStrictCount} → ${results.length}`
+        `[TVBox Search Proxy] Strict mode: ${beforeStrictCount} → ${results.length}`,
       );
+    }
+
+    if (results.length > 0) {
+      const beforeResolutionFilterCount = results.length;
+      results = filterSearchResultsByResolution(results, resolutionFilter);
+      if (resolutionFilter.minLevel) {
+        console.log(
+          `[TVBox Search Proxy] Resolution filter ${formatResolutionLabel(
+            resolutionFilter.minLevel,
+          )}${resolutionFilter.strict ? ' strict' : ''}: ${beforeResolutionFilterCount} → ${results.length}`,
+        );
+      }
     }
 
     const processingTime = Date.now() - startTime;
     console.log(
-      `[TVBox Search Proxy] Completed in ${processingTime}ms, returning ${results.length} results`
+      `[TVBox Search Proxy] Completed in ${processingTime}ms, returning ${results.length} results`,
     );
 
     // 返回TVBox兼容的格式
@@ -250,7 +276,14 @@ export async function GET(request: NextRequest) {
           vod_id: r.id,
           vod_name: r.title,
           vod_pic: r.poster,
-          vod_remarks: raw.note || raw.remark || '',
+          vod_remarks:
+            raw.remarks ||
+            raw.note ||
+            raw.remark ||
+            r.resolution ||
+            r.quality_tag ||
+            '',
+          vod_resolution: r.resolution || '',
           vod_year: raw.year || '',
           vod_area: raw.area || '',
           vod_actor: raw.actor || '',
@@ -273,6 +306,10 @@ export async function GET(request: NextRequest) {
         'X-Processing-Time': `${processingTime}ms`,
         'X-Result-Count': `${results.length}`,
         'X-Filter-Applied': shouldFilter ? 'true' : 'false',
+        'X-Min-Resolution': resolutionFilter.minLevel
+          ? formatResolutionLabel(resolutionFilter.minLevel)
+          : 'off',
+        'X-Resolution-Strict': resolutionFilter.strict ? 'true' : 'false',
       },
     });
   } catch (error) {
@@ -283,7 +320,7 @@ export async function GET(request: NextRequest) {
         msg: error instanceof Error ? error.message : '搜索失败',
         list: [],
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
@@ -327,7 +364,7 @@ function levenshteinDistance(str1: string, str2: string): number {
       matrix[i][j] = Math.min(
         matrix[i - 1][j] + 1, // 删除
         matrix[i][j - 1] + 1, // 插入
-        matrix[i - 1][j - 1] + cost // 替换
+        matrix[i - 1][j - 1] + cost, // 替换
       );
     }
   }

@@ -2,23 +2,36 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { getAuthInfoFromCookie, verifyApiAuth } from '@/lib/auth';
 import { toSimplified } from '@/lib/chinese';
 import { getAvailableApiSites, getCacheTime, getConfig } from '@/lib/config';
 import { searchFromApi } from '@/lib/downstream';
+import { rewriteEpisodesForAdFilterMany } from '@/lib/episode-rewriter';
 import { rankSearchResults } from '@/lib/search-ranking';
+import {
+  buildResolutionFilterFromSearchParams,
+  filterSearchResultsByResolution,
+  formatResolutionLabel,
+} from '@/lib/video-quality';
 import { yellowWords } from '@/lib/yellow';
 
 export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
-  const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
+  // 使用统一的认证函数，支持本地模式和数据库模式
+  const authResult = verifyApiAuth(request);
+  if (!authResult.isValid) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
+  // 获取用户名（本地模式可能没有 username）
+  const authInfo = getAuthInfoFromCookie(request);
+  const username =
+    authInfo?.username || (authResult.isLocalMode ? '__local__' : '');
+
   const { searchParams } = new URL(request.url);
   const query = searchParams.get('q');
+  const resolutionFilter = buildResolutionFilterFromSearchParams(searchParams);
 
   if (!query) {
     const cacheTime = await getCacheTime();
@@ -36,7 +49,7 @@ export async function GET(request: NextRequest) {
   }
 
   const config = await getConfig();
-  const apiSites = await getAvailableApiSites(authInfo.username);
+  const apiSites = await getAvailableApiSites(username);
 
   // 🔒 成人内容过滤逻辑
   // URL 参数优先级: ?adult=1 (显示成人) > ?filter=off (显示成人) > 全局配置
@@ -131,6 +144,11 @@ export async function GET(request: NextRequest) {
       normalizedQuery || query,
     );
 
+    flattenedResults = filterSearchResultsByResolution(
+      flattenedResults,
+      resolutionFilter,
+    );
+
     const cacheTime = await getCacheTime();
 
     if (flattenedResults.length === 0) {
@@ -138,8 +156,13 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ results: [] }, { status: 200 });
     }
 
+    const rewrittenResults = await rewriteEpisodesForAdFilterMany(
+      flattenedResults,
+      request,
+    );
+
     return NextResponse.json(
-      { results: flattenedResults, normalizedQuery },
+      { results: rewrittenResults, normalizedQuery },
       {
         headers: {
           'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}`,
@@ -147,6 +170,10 @@ export async function GET(request: NextRequest) {
           'Vercel-CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
           'Netlify-Vary': 'query',
           'X-Adult-Filter': shouldFilterAdult ? 'enabled' : 'disabled', // 调试信息
+          'X-Min-Resolution': resolutionFilter.minLevel
+            ? formatResolutionLabel(resolutionFilter.minLevel)
+            : 'off',
+          'X-Resolution-Strict': resolutionFilter.strict ? 'true' : 'false',
         },
       },
     );

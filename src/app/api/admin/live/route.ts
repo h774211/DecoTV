@@ -2,21 +2,19 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { persistAdminConfigMutation } from '@/lib/admin-config-mutation';
+import { verifyApiAuth } from '@/lib/auth';
 import { getConfig } from '@/lib/config';
-import { db } from '@/lib/db';
 import { deleteCachedLiveChannels, refreshLiveChannels } from '@/lib/live';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-  const hasRedis = !!(process.env.REDIS_URL || process.env.KV_REST_API_URL);
-  const isLocalMode = storageType === 'localstorage' && !hasRedis;
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
 
-  // 🔐 本地模式（无数据库）：跳过认证，返回成功
-  // 安全性说明：仅当没有配置任何数据库时才启用此模式
-  if (isLocalMode) {
+  // 本地模式（无数据库）：跳过认证，返回成功
+  if (authResult.isLocalMode) {
     return NextResponse.json(
       {
         ok: true,
@@ -27,12 +25,20 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // 认证失败
+  if (!authResult.isValid) {
+    console.log('[admin/live] 认证失败:', {
+      hasAuth: !!request.cookies.get('auth'),
+      isLocalMode: authResult.isLocalMode,
+    });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   try {
-    // 权限检查
-    const authInfo = getAuthInfoFromCookie(request);
-    const username = authInfo?.username;
+    // 权限检查（仅数据库模式需要）
+    const username = authResult.username;
     const config = await getConfig();
-    if (username !== process.env.USERNAME) {
+    if (username && username !== process.env.USERNAME) {
       // 管理员
       const user = config.UserConfig.Users.find((u) => u.username === username);
       if (!user || user.role !== 'admin' || user.banned) {
@@ -187,8 +193,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: '未知操作' }, { status: 400 });
     }
 
-    // 保存配置
-    await db.saveAdminConfig(config);
+    await persistAdminConfigMutation(config);
 
     return NextResponse.json({ success: true });
   } catch (error) {
