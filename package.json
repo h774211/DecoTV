@@ -21,6 +21,7 @@
     "postbuild": "echo 'Build completed - sitemap generation disabled'",
     "prepare": "husky install",
     "vercel-build": "pnpm gen:manifest && pnpm copy:version && NODE_OPTIONS='--max-old-space-size=3072' next build",
+    "pages:build": "pnpm gen:manifest && pnpm gen:version && NODE_OPTIONS='--max-old-space-size=3072' next build && npx @cloudflare/next-on-pages --experimental-minify",
     "docker:build": "docker build -t decotv .",
     "docker:run": "docker run -p 3000:3000 decotv"
   },
